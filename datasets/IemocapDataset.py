@@ -4,10 +4,7 @@ import torchaudio
 import pandas as pd
 import numpy as np
 import torch.nn.functional as F
-from PIL import Image
-
-from utils.video_utils import sample_frames, process_image, make_grid
-
+from utils.video_utils import sample_frames
 
 class IemocapDataset(object):
     """
@@ -16,13 +13,11 @@ class IemocapDataset(object):
     """
 
     _ext_audio = '.wav'
-    _emotions = {'ang': 0, 'hap': 1, 'exc': 1, 'sad': 3, 'fru': 4, 'fea': 5, 'sur': 6, 'neu': 7, 'xxx': 8}
-    _emotion_str = {0: 'angry', 1: 'happy', 2: 'excited', 3: 'sad', 4: 'frustrated', 5: 'fearful', 6: 'surprised',
-                    7: 'neutral', 8: 'unknown'}
+    _emotions = { 'ang': 0, 'hap': 1, 'exc': 1, 'sad': 3, 'fru': 4, 'fea': 5, 'sur': 6, 'neu': 7, 'xxx': 8 }
 
     def __init__(self,
                  root='IEMOCAP_full_release',
-                 emotions=['ang', 'hap', 'exc', 'sad', 'neu', 'fru'],
+                 emotions=['ang', 'hap', 'exc', 'sad', 'neu'],
                  sessions=[1, 2, 3, 4, 5],
                  script_impro=['script', 'impro'],
                  genders=['M', 'F']):
@@ -34,29 +29,7 @@ class IemocapDataset(object):
 
         # Iterate through all 5 sessions
         data = []
-        transcriptions = {}
         for i in range(1, 6):
-            transcription_path = os.path.join(root, 'Session' + str(i), 'dialog', 'transcriptions')
-            # Get list of transcription files
-            transcription_files = [file for file in os.listdir(transcription_path) if file.endswith('.txt')]
-            for file in transcription_files:
-                with open(os.path.join(transcription_path, file), 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        # Split the line into parts on the ']: ' which
-                        # marks the end of the key and the start of the transcription
-                        parts = line.split(']: ')
-
-                        # Check if the line was split into exactly two parts
-                        if len(parts) == 2:
-                            # The first part is further split by space to separate the key from the timestamp
-                            key = parts[0].split(' [')[0]
-                            # The second part is the transcription text
-                            transcription = parts[1]
-
-                            # Store the key and transcription in the dictionary
-                            transcriptions[key] = transcription
-
             # Define path to evaluation files of this session
             path = os.path.join(root, 'Session' + str(i), 'dialog', 'EmoEvaluation')
 
@@ -120,7 +93,6 @@ class IemocapDataset(object):
         # Map file to correct path w.r.t to root
         self.df['audio_file'] = [os.path.join('Session' + file[4], 'sentences', 'wav', file[:-5], file + self._ext_audio) for file in self.df['file']]
         self.df['video_file'] = [os.path.join('Session' + file[4], 'dialog', 'avi', 'DivX', file[:-5] + '.avi') for file in self.df['file']]
-        self.df['transcription'] = [transcriptions[file] for file in self.df['file']]
 
     def __len__(self):
         return len(self.df)
@@ -133,33 +105,22 @@ class IemocapDataset(object):
         video_name = os.path.join(self.root, self.df.loc[idx, 'video_file'])
         waveform, sample_rate = torchaudio.load(audio_name)
         emotion = self.df.loc[idx, 'emotion']
-        emotion_str = self._emotion_str[int(emotion)]
         activation = self.df.loc[idx, 'activation']
         valence = self.df.loc[idx, 'valence']
         dominance = self.df.loc[idx, 'dominance']
         start = self.df.loc[idx, 'start']
         end = self.df.loc[idx, 'end']
         frames = sample_frames(video_name, num_frames=4, start=start, end=end)
-        grid = make_grid(frames)
-        grid = np.array(grid)
-        raw_frames = grid
-        frames = process_image(Image.fromarray(grid))
-        # frames = [process_image(Image.fromarray(frame)) for frame in frames]
-        # frames = torch.cat(frames)
-        transcription = self.df.loc[idx, 'transcription']
 
         sample = {
             'audio_path': audio_name,
             'video_path': video_name,
-            'transcription': transcription,
             'frames': frames,
-            'raw_frames': raw_frames,
             'start': start,
             'end': end,
             'waveform': waveform,
             'sample_rate': sample_rate,
             'emotion': emotion,
-            'emotion_str': emotion_str,
             'activation': activation,
             'valence': valence,
             'dominance': dominance
