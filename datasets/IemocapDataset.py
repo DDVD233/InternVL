@@ -4,7 +4,9 @@ import torchaudio
 import pandas as pd
 import numpy as np
 import torch.nn.functional as F
-from utils.video_utils import sample_frames
+from PIL import Image
+
+from utils.video_utils import sample_frames, process_image
 
 class IemocapDataset(object):
     """
@@ -114,6 +116,8 @@ class IemocapDataset(object):
         start = self.df.loc[idx, 'start']
         end = self.df.loc[idx, 'end']
         frames = sample_frames(video_name, num_frames=4, start=start, end=end)
+        frames = [process_image(Image.fromarray(frame)) for frame in frames]
+        frames = torch.cat(frames).to(torch.float16)
 
         sample = {
             'audio_path': audio_name,
