@@ -6,12 +6,12 @@
 
 import copy
 
-from internvl.model.internlm2.configuration_internlm2 import InternLM2Config
 from transformers import AutoConfig, LlamaConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from .configuration_intern_vit import InternVisionConfig
+from .configuration_internlm2 import InternLM2Config
 
 logger = logging.get_logger(__name__)
 
@@ -27,7 +27,7 @@ class InternVLChatConfig(PretrainedConfig):
             use_backbone_lora=0,
             use_llm_lora=0,
             pad2square=False,
-            select_layer=-4,
+            select_layer=-1,
             force_image_size=None,
             downsample_ratio=0.5,
             template=None,

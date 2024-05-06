@@ -7,7 +7,6 @@ import warnings
 from typing import Any, List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
-from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.nn import CrossEntropyLoss
@@ -19,6 +18,7 @@ from transformers.utils import ModelOutput, logging
 
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
+from .modeling_internlm2 import InternLM2ForCausalLM
 
 logger = logging.get_logger(__name__)
 
@@ -26,7 +26,7 @@ logger = logging.get_logger(__name__)
 class InternVLChatModel(PreTrainedModel):
     config_class = InternVLChatConfig
     main_input_name = 'pixel_values'
-    _no_split_modules = ['InternVisionEncoderLayer', 'LlamaDecoderLayer', 'LlamaForCausalLM']
+    _no_split_modules = ['InternVisionEncoderLayer', 'LlamaDecoderLayer']
 
     def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None):
         super().__init__(config)
@@ -132,7 +132,8 @@ class InternVLChatModel(PreTrainedModel):
         input_embeds = input_embeds.reshape(B * N, C)
 
         if torch.distributed.get_rank() == 0:
-            print(f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
+            print(
+                f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
 
         input_ids = input_ids.reshape(B * N)
         selected = (input_ids == self.img_context_token_id)
@@ -229,6 +230,48 @@ class InternVLChatModel(PreTrainedModel):
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
+    def batch_chat(self, tokenizer, pixel_values, image_counts, questions, generation_config, history=None,
+                   return_history=False, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>',
+                   IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
+        if history is not None or return_history:
+            print("Now multi-turn chat is not supported in batch_chat.")
+            raise NotImplementedError
+        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self.img_context_token_id = img_context_token_id
+        if tokenizer.convert_tokens_to_ids('<|im_end|>') != 0:
+            eos_token_id = tokenizer.convert_tokens_to_ids('<|im_end|>')  # 92542, InternLM2
+        else:
+            eos_token_id = tokenizer.eos_token_id
+
+        from .conversation import get_conv_template
+
+        queries = []
+        image_bs = pixel_values.shape[0]
+        print(f'dynamic ViT batch size: {image_bs}, image_counts: {image_counts}')
+        for idx, image_count in enumerate(image_counts):
+            image_token = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_count + IMG_END_TOKEN
+            question = image_token + '\n' + questions[idx]
+            template = get_conv_template(self.template)
+            template.append_message(template.roles[0], question)
+            template.append_message(template.roles[1], None)
+            query = template.get_prompt()
+            queries.append(query)
+        tokenizer.padding_side = 'left'
+        model_inputs = tokenizer(queries, return_tensors='pt', padding=True)
+        input_ids = model_inputs['input_ids'].cuda()
+        attention_mask = model_inputs['attention_mask'].cuda()
+        generation_config['eos_token_id'] = eos_token_id
+
+        generation_output = self.generate(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **generation_config
+        )
+        responses = tokenizer.batch_decode(generation_output, skip_special_tokens=True)
+        responses = [response.split('<|im_end|>')[0].strip() for response in responses]  # for InternLM2
+        return responses
+
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
              IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
 
@@ -239,7 +282,7 @@ class InternVLChatModel(PreTrainedModel):
         else:
             eos_token_id = tokenizer.eos_token_id
 
-        from internvl.conversation import get_conv_template
+        from .conversation import get_conv_template
 
         template = get_conv_template(self.template)
         image_bs = pixel_values.shape[0]
@@ -271,59 +314,8 @@ class InternVLChatModel(PreTrainedModel):
         if return_history:
             return response, history
         else:
-            query_to_print = query.replace(image_tokens, '<image>')
-            print(query_to_print, response)
-            return response
-        return response
-
-    def multi_image_chat(self, tokenizer, pixel_values, image_counts, question, generation_config, history=None,
-                         return_history=False, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
-
-        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-        self.img_context_token_id = img_context_token_id
-        if tokenizer.convert_tokens_to_ids('<|im_end|>') != 0:
-            eos_token_id = tokenizer.convert_tokens_to_ids('<|im_end|>')  # 92542, InternLM2
-        else:
-            eos_token_id = tokenizer.eos_token_id
-
-        from internvl.conversation import get_conv_template
-
-        template = get_conv_template(self.template)
-
-        if history is None:
-            history = []
-            image_tokens = ''
-            image_bs = pixel_values.shape[0]
-            print(f'dynamic ViT batch size: {image_bs}, image_counts: {image_counts}')
-            for idx, image_count in enumerate(range(image_counts)):
-                image_tokens += f'<image {idx+1}> (图{idx+1}):' + IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_count + IMG_END_TOKEN
-            question = image_tokens + '\n' + question
-        else:
-            for (old_question, old_answer) in history:
-                template.append_message(template.roles[0], old_question)
-                template.append_message(template.roles[1], old_answer)
-        template.append_message(template.roles[0], question)
-        template.append_message(template.roles[1], None)
-        query = template.get_prompt()
-        model_inputs = tokenizer(query, return_tensors='pt')
-        input_ids = model_inputs['input_ids'].cuda()
-        attention_mask = model_inputs['attention_mask'].cuda()
-        generation_config['eos_token_id'] = eos_token_id
-
-        generation_output = self.generate(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **generation_config
-        )
-        response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
-        response = response.split('<|im_end|>')[0].strip()  # for InternLM2
-        history.append((question, response))
-        if return_history:
-            return response, history
-        else:
-            query_to_print = query.replace(image_tokens, '<image>')
-            print(query_to_print, response)
+            # query_to_print = query.replace(image_tokens, '<image>')
+            # print(query_to_print, response)
             return response
         return response
 
@@ -346,7 +338,6 @@ class InternVLChatModel(PreTrainedModel):
                 vit_embeds = visual_features
             else:
                 vit_embeds = self.extract_feature(pixel_values)
-
             input_embeds = self.language_model.get_input_embeddings()(input_ids)
             B, N, C = input_embeds.shape
             input_embeds = input_embeds.reshape(B * N, C)
@@ -354,7 +345,7 @@ class InternVLChatModel(PreTrainedModel):
             input_ids = input_ids.reshape(B * N)
             selected = (input_ids == self.img_context_token_id)
             assert selected.sum() != 0
-            input_embeds[selected] = vit_embeds.reshape(-1, C)
+            input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
 
             input_embeds = input_embeds.reshape(B, N, C)
         else:
