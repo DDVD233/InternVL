@@ -131,9 +131,9 @@ class InternVLChatModel(PreTrainedModel):
         B, N, C = input_embeds.shape
         input_embeds = input_embeds.reshape(B * N, C)
 
-        if torch.distributed.get_rank() == 0:
-            print(
-                f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
+        # if torch.distributed.get_rank() == 0:
+        #     print(
+        #         f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
 
         input_ids = input_ids.reshape(B * N)
         selected = (input_ids == self.img_context_token_id)
@@ -247,7 +247,7 @@ class InternVLChatModel(PreTrainedModel):
 
         queries = []
         image_bs = pixel_values.shape[0]
-        print(f'dynamic ViT batch size: {image_bs}, image_counts: {image_counts}')
+        # print(f'dynamic ViT batch size: {image_bs}, image_counts: {image_counts}')
         for idx, image_count in enumerate(image_counts):
             image_token = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_count + IMG_END_TOKEN
             question = image_token + '\n' + questions[idx]
@@ -282,11 +282,11 @@ class InternVLChatModel(PreTrainedModel):
         else:
             eos_token_id = tokenizer.eos_token_id
 
-        from .conversation import get_conv_template
+        from internvl.conversation import get_conv_template
 
         template = get_conv_template(self.template)
         image_bs = pixel_values.shape[0]
-        print(f'dynamic ViT batch size: {image_bs}')
+        # print(f'dynamic ViT batch size: {image_bs}')
         if history is None:
             history = []
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_bs + IMG_END_TOKEN
