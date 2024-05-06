@@ -26,7 +26,7 @@ def main():
     iemocap_dataset = IemocapDataset(
         '/home/dvd/data/depression_interview/dataset/IEMOCAP_full_release/IEMOCAP_full_release')
     data_loader = torch.utils.data.DataLoader(iemocap_dataset, batch_size=1, shuffle=True)
-    path = "OpenGVLab/InternViT-6B-448px-V1-5"
+    path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
     model = InternVLChatModel.from_pretrained(
         path,
         torch_dtype=torch.bfloat16,
