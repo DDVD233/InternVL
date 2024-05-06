@@ -13,11 +13,13 @@ class IemocapDataset(object):
     """
 
     _ext_audio = '.wav'
-    _emotions = { 'ang': 0, 'hap': 1, 'exc': 1, 'sad': 3, 'fru': 4, 'fea': 5, 'sur': 6, 'neu': 7, 'xxx': 8 }
+    _emotions = {'ang': 0, 'hap': 1, 'exc': 1, 'sad': 3, 'fru': 4, 'fea': 5, 'sur': 6, 'neu': 7, 'xxx': 8}
+    _emotion_str = {0: 'angry', 1: 'happy', 2: 'excited', 3: 'sad', 4: 'frustrated', 5: 'fearful', 6: 'surprised',
+                    7: 'neutral', 8: 'unknown'}
 
     def __init__(self,
                  root='IEMOCAP_full_release',
-                 emotions=['ang', 'hap', 'exc', 'sad', 'neu'],
+                 emotions=['ang', 'hap', 'exc', 'sad', 'neu', 'fru'],
                  sessions=[1, 2, 3, 4, 5],
                  script_impro=['script', 'impro'],
                  genders=['M', 'F']):
@@ -105,6 +107,7 @@ class IemocapDataset(object):
         video_name = os.path.join(self.root, self.df.loc[idx, 'video_file'])
         waveform, sample_rate = torchaudio.load(audio_name)
         emotion = self.df.loc[idx, 'emotion']
+        emotion_str = self._emotion_str[int(emotion)]
         activation = self.df.loc[idx, 'activation']
         valence = self.df.loc[idx, 'valence']
         dominance = self.df.loc[idx, 'dominance']
@@ -121,6 +124,7 @@ class IemocapDataset(object):
             'waveform': waveform,
             'sample_rate': sample_rate,
             'emotion': emotion,
+            'emotion_str': emotion_str,
             'activation': activation,
             'valence': valence,
             'dominance': dominance
