@@ -295,7 +295,7 @@ class InternVLChatModel(PreTrainedModel):
             image_tokens = ''
             image_bs = pixel_values.shape[0]
             print(f'dynamic ViT batch size: {image_bs}, image_counts: {image_counts}')
-            for idx, image_count in enumerate(image_counts):
+            for idx, image_count in enumerate(range(image_counts)):
                 image_tokens += f'<image {idx+1}> (图{idx+1}):' + IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_count + IMG_END_TOKEN
             question = image_tokens + '\n' + question
         else:
