@@ -10,6 +10,8 @@ from datasets.IemocapDataset import IemocapDataset
 from internvl.model.internvl_chat import InternVLChatModel
 from torchmetrics import Accuracy, F1Score
 
+import argparse
+
 
 def make_grid(images):
     # Reshape the input tensor to (B, 2, 2, H, W, C)
@@ -24,7 +26,10 @@ def make_grid(images):
     return images
 
 
-def main():
+def main(transcription_on=False):
+    # Print configs
+    print(f'Transcription: {transcription_on}')
+
     # Initialize IemocapDataset
     iemocap_dataset = IemocapDataset(
         '/home/dvd/data/depression_interview/dataset/IEMOCAP_full_release/IEMOCAP_full_release',
@@ -65,8 +70,13 @@ def main():
             do_sample=False,
         )
 
-        question = ("This is a set of 4 frames from a video. What is the emotion of the speaker? "
-                    "Answer with one word from the following: happy, sad, neutral, angry, excited, and frustrated.")
+        question = "These are 4 frames from a video. "
+        if transcription_on:
+            question += "The speaker said: \"" + sample['transcription'][0] + "\" "
+        question += ("What is the emotion of the speaker? "
+                     "Using both the frames and the transcription, answer with one word from the following: "
+                     "happy, sad, neutral, angry, excited, and frustrated.")
+
         response = model.chat(tokenizer, frames[0], question, generation_config)
         # print('-' * 50)
         target = sample['emotion_str'][0]
@@ -104,4 +114,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--transcription', action='store_true')
+    args = parser.parse_args()
+    main(transcription_on=args.transcription)
