@@ -66,7 +66,7 @@ def build_transform(input_size):
         T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
         T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
         T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD)
+        # T.Normalize(mean=MEAN, std=STD)
     ])
     return transform
 

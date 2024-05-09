@@ -89,6 +89,9 @@ class InternVLChatModel(PreTrainedModel):
         self.img_context_token_id = None
         self.audio_context_token_id = None
         self.neftune_alpha = None
+        self._dtype = self.dtype
+        self.gpu0 = torch.device('cuda:0')
+        self.gpu1 = torch.device('cuda:1')
 
         # Initialize parameters
         self.init_weights()
@@ -107,10 +110,18 @@ class InternVLChatModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
     def to_type(self, dtype):
-        # self.vision_model.to_type(dtype)
+        self.vision_model.type(dtype)
         self.language_model.to(dtype)
         self.mlp1.to(dtype)
         self.mlp2.to(dtype)
+        self._dtype = dtype
+        return self
+
+    def to_gpu(self):
+        # self.vision_model.cuda()
+        self.language_model.cuda()
+        self.mlp1.cuda()
+        self.mlp2.cuda()
         return self
 
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
@@ -328,7 +339,7 @@ class InternVLChatModel(PreTrainedModel):
             audio_span_tokens = audio_info["audio_span_tokens"]
             input_audio_lengths = audio_info["input_audio_lengths"]
             audio_features = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)[0]
-            audio_features = audio_features.to(self.device).to(self.dtype)
+            audio_features = audio_features.to(self.device).to(self._dtype)
             audio_features = self.mlp2(audio_features)
         else:
             audio_features = None

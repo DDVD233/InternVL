@@ -44,15 +44,16 @@ def main(transcription_on=False):
                                               num_workers=8)
     length = len(data_loader)
     # path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
-    path = "OpenGVLab/InternVL-Chat-ViT-6B-Vicuna-7B"
+    path = "OpenGVLab/InternVL-Chat-V1-5"
     # load in bfloat16
     model: InternVLChatModel = InternVLChatModel.from_pretrained(
         path,
         low_cpu_mem_usage=False,
-        # torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     ).eval()
-    model.to_type(torch.bfloat16)
-    model = model.cuda()
+    model.to_gpu()
+    # model.to_type(torch.bfloat16)
+    # model = model.cuda()
     model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
     model.template = 'internvl_zh'
 
