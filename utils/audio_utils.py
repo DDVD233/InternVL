@@ -14,7 +14,7 @@ def process_audio(audio_path):
     audio_len = [audio_len_after_cnn, audio_token_num]
     audios.append(mel)
     audio_lens.append(audio_len)
-    audio_span_tokens.append(audio_token_num - 2)
+    audio_span_tokens.append(audio_token_num)
     input_audio_lengths = torch.IntTensor(audio_lens)
     input_audios = torch.stack(audios, dim=0)
     return {"input_audios": input_audios,

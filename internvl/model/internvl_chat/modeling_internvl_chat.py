@@ -106,6 +106,13 @@ class InternVLChatModel(PreTrainedModel):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
+    def to_type(self, dtype):
+        # self.vision_model.to_type(dtype)
+        self.language_model.to(dtype)
+        self.mlp1.to(dtype)
+        self.mlp2.to(dtype)
+        return self
+
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
             r=r,
@@ -232,6 +239,7 @@ class InternVLChatModel(PreTrainedModel):
         return vit_embeds + noise
 
     def extract_feature(self, pixel_values):
+        pixel_values = pixel_values.to(self.device).to(self.dtype)
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
                 pixel_values=pixel_values,
@@ -319,7 +327,8 @@ class InternVLChatModel(PreTrainedModel):
             audios = audio_info["input_audios"]
             audio_span_tokens = audio_info["audio_span_tokens"]
             input_audio_lengths = audio_info["input_audio_lengths"]
-            audio_features = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)
+            audio_features = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)[0]
+            audio_features = audio_features.to(self.device).to(self.dtype)
             audio_features = self.mlp2(audio_features)
         else:
             audio_features = None

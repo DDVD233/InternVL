@@ -435,9 +435,9 @@ class AudioEncoder(nn.Module):
         output_audios = []
         for i in range(len(audio_span_tokens)):
             audio_span = audio_span_tokens[i]
-            audio = x[i][:audio_span-2]
-            if bos is not None:
-                audio = torch.concat([bos, audio, eos])
+            audio = x[i][:audio_span]
+            # if bos is not None:
+            #     audio = torch.concat([bos, audio, eos])
             assert len(audio) == audio_span
             output_audios.append(audio)
         return output_audios
