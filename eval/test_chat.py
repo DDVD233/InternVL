@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from datasets.IemocapDataset import IemocapDataset
 from internvl.model.internvl_chat import InternVLChatModel
 from torchmetrics import Accuracy, F1Score
+from utils.audio_utils import process_audio
 
 import argparse
 
@@ -37,10 +38,15 @@ def main(transcription_on=False):
     data_loader = torch.utils.data.DataLoader(iemocap_dataset, batch_size=1, shuffle=True, pin_memory=True,
                                               num_workers=8)
     length = len(data_loader)
-    path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
+    # path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
+    path = "OpenGVLab/InternVL-Chat-V1-1"
+    # load in bfloat16
     model = InternVLChatModel.from_pretrained(
         path,
-        low_cpu_mem_usage=True).eval()
+        low_cpu_mem_usage=False,
+        torch_dtype=torch.bfloat16,
+    ).eval().cuda()
+    model.audio.load_state_dict(torch.load('audio.pth'))
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
@@ -58,11 +64,9 @@ def main(transcription_on=False):
 
     for index, sample in enumerate(data_loader):
         frames: List[numpy.ndarray] = sample['frames']  # 4, H, W, C
-        # make 2x2 grid of frames, shape = 2H, 2W, C
-        # frame = frames[0]
-        # grid = make_grid(frames)
+        audio_path = sample['audio_path'][0]
 
-        # for index_f, frame in enumerate(frames):
+        processed_audio = process_audio(audio_path)
 
         generation_config = dict(
             num_beams=1,

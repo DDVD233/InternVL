@@ -20,6 +20,8 @@ from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
 from .modeling_internlm2 import InternLM2ForCausalLM
 
+from utils.audio import AudioEncoder
+
 logger = logging.get_logger(__name__)
 
 
@@ -66,6 +68,16 @@ class InternVLChatModel(PreTrainedModel):
             nn.Linear(llm_hidden_size, llm_hidden_size)
         )
 
+        self.audio = AudioEncoder(80, 1500, 1280, 20, 32, output_dim=4096)
+        audio_hidden_size = 1280
+        self.mlp2 = nn.Sequential(
+            nn.LayerNorm(audio_hidden_size),
+            nn.Linear(audio_hidden_size, llm_hidden_size),
+            nn.GELU(),
+            nn.Linear(llm_hidden_size, llm_hidden_size)
+        )
+
+
         # if config.force_image_size != config.vision_config.image_size:
         #     self.vision_model.resize_pos_embeddings(
         #         old_size=config.vision_config.image_size,
@@ -76,11 +88,21 @@ class InternVLChatModel(PreTrainedModel):
         self.img_context_token_id = None
         self.neftune_alpha = None
 
+        # Initialize parameters
+        self.init_weights()
+
         if config.use_backbone_lora:
             self.wrap_backbone_lora(r=config.use_backbone_lora, lora_alpha=2 * config.use_backbone_lora)
 
         if config.use_llm_lora:
             self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            torch.nn.init.xavier_uniform_(module.weight)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
@@ -243,7 +265,7 @@ class InternVLChatModel(PreTrainedModel):
         else:
             eos_token_id = tokenizer.eos_token_id
 
-        from .conversation import get_conv_template
+        from internvl.conversation import get_conv_template
 
         queries = []
         image_bs = pixel_values.shape[0]
