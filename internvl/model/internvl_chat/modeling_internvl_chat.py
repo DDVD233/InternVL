@@ -68,7 +68,8 @@ class InternVLChatModel(PreTrainedModel):
             nn.Linear(llm_hidden_size, llm_hidden_size)
         )
 
-        self.audio = AudioEncoder(80, 1500, 1280, 20, 32, output_dim=4096)
+        self.audio = AudioEncoder(80, 1500, 1280, 20, 32,
+                                  output_dim=4096, add_audio_bos_eos_token=False)
         audio_hidden_size = 1280
         self.mlp2 = nn.Sequential(
             nn.LayerNorm(audio_hidden_size),

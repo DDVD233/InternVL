@@ -51,11 +51,11 @@ def main(transcription_on=False):
         low_cpu_mem_usage=False,
         torch_dtype=torch.bfloat16,
     ).eval().cuda()
-    model.audio.load_state_dict(torch.load('audio.pth'))
+    model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     tokenizer.add_tokens([AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN], special_tokens=True)
-    model.resize_token_embeddings(len(tokenizer))
+    model.language_model.resize_token_embeddings(len(tokenizer))
 
     categories = ['happy', 'sad', 'neutral', 'angry', 'excited', 'frustrated', 'unknown']
     metrics = {
@@ -72,7 +72,6 @@ def main(transcription_on=False):
     for index, sample in enumerate(data_loader):
         frames: List[numpy.ndarray] = sample['frames']  # 4, H, W, C
         audio_path = sample['audio_path'][0]
-
         processed_audio = process_audio(audio_path)
 
         generation_config = dict(
@@ -88,7 +87,7 @@ def main(transcription_on=False):
                      "Using both the frames and the transcription, answer with one word from the following: "
                      "happy, sad, neutral, angry, excited, and frustrated.")
 
-        response = model.chat(tokenizer, frames[0], question, generation_config)
+        response = model.chat(tokenizer, frames[0], question, generation_config, audio_info=processed_audio)
         # print('-' * 50)
         target = sample['emotion_str'][0]
         print(f'Response: {response}, Target: {target}. The answer is correct: {response == target}')
