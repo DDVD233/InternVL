@@ -86,6 +86,7 @@ class InternVLChatModel(PreTrainedModel):
         #     )
 
         self.img_context_token_id = None
+        self.audio_context_token_id = None
         self.neftune_alpha = None
 
         # Initialize parameters
@@ -295,10 +296,14 @@ class InternVLChatModel(PreTrainedModel):
         return responses
 
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
-             IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
+             IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', audio_info=None):
+        AUDIO_START_TOKEN = '<audio>'
+        AUDIO_END_TOKEN = '</audio>'
+        AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
 
         img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_context_token_id = img_context_token_id
+        self.audio_context_token_id = tokenizer.convert_tokens_to_ids(AUDIO_CONTEXT_TOKEN)
         if tokenizer.convert_tokens_to_ids('<|im_end|>') != 0:
             eos_token_id = tokenizer.convert_tokens_to_ids('<|im_end|>')  # 92542, InternLM2
         else:
@@ -308,10 +313,23 @@ class InternVLChatModel(PreTrainedModel):
 
         template = get_conv_template(self.template)
         image_bs = pixel_values.shape[0]
+
+        if audio_info is not None:
+            audios = audio_info["input_audios"]
+            audio_span_tokens = audio_info["audio_span_tokens"]
+            input_audio_lengths = audio_info["input_audio_lengths"]
+            audio_features = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)
+            audio_features = self.mlp2(audio_features)
+        else:
+            audio_features = None
+
         # print(f'dynamic ViT batch size: {image_bs}')
         if history is None:
             history = []
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_bs + IMG_END_TOKEN
+            if audio_features is not None:
+                audio_tokens = AUDIO_START_TOKEN + AUDIO_CONTEXT_TOKEN * audio_features.size(1) + AUDIO_END_TOKEN
+                image_tokens += '\n' + audio_tokens
             question = image_tokens + '\n' + question
         else:
             for (old_question, old_answer) in history:
@@ -328,6 +346,7 @@ class InternVLChatModel(PreTrainedModel):
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
+            audio_features=audio_features,
             **generation_config
         )
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
@@ -351,16 +370,17 @@ class InternVLChatModel(PreTrainedModel):
             generation_config: Optional[GenerationConfig] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            audio_features: Optional[torch.FloatTensor] = None,
             **generate_kwargs,
     ) -> torch.LongTensor:
 
         assert self.img_context_token_id is not None
+        input_embeds = self.language_model.get_input_embeddings()(input_ids)
         if pixel_values is not None:
             if visual_features is not None:
                 vit_embeds = visual_features
             else:
                 vit_embeds = self.extract_feature(pixel_values)
-            input_embeds = self.language_model.get_input_embeddings()(input_ids)
             B, N, C = input_embeds.shape
             input_embeds = input_embeds.reshape(B * N, C)
 
@@ -370,8 +390,14 @@ class InternVLChatModel(PreTrainedModel):
             input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
 
             input_embeds = input_embeds.reshape(B, N, C)
-        else:
-            input_embeds = self.language_model.get_input_embeddings()(input_ids)
+        if audio_features is not None:
+            B, N, C = input_embeds.shape
+            input_embeds = input_embeds.reshape(B * N, C)
+            selected = (input_ids == self.audio_context_token_id)
+            assert selected.sum() != 0
+            input_embeds[selected] = audio_features.reshape(-1, C).to(input_embeds.device)
+            input_embeds = input_embeds.reshape(B, N, C)
+
 
         outputs = self.language_model.generate(
             inputs_embeds=input_embeds,

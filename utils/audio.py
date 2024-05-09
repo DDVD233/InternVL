@@ -148,7 +148,7 @@ def mel_filters(device, n_mels: int = N_MELS) -> torch.Tensor:
     """
     assert n_mels == 80, f"Unsupported n_mels: {n_mels}"
     with np.load(
-        os.path.join(os.path.dirname(__file__), "mel_filters.npz") # todo
+        os.path.join(os.path.dirname(__file__), "mel_filters.npz")  # todo
         # os.path.join("assets", "mel_filters.npz")
     ) as f:
         return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
@@ -354,13 +354,13 @@ class AudioEncoder(nn.Module):
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         )
-        self.ln_post = LayerNorm(n_state)
+        # self.ln_post = LayerNorm(n_state)
 
         if avg_pool:
             self.avg_pooler = nn.AvgPool1d(2, stride=2)
         else:
             self.avg_pooler = None
-        self.proj = nn.Linear(n_state, output_dim)
+        # self.proj = nn.Linear(n_state, output_dim)
         if add_audio_bos_eos_token:
             self.audio_bos_eos_token = nn.Embedding(2, output_dim)
         else:
@@ -414,8 +414,8 @@ class AudioEncoder(nn.Module):
             x = x.permute(0, 2, 1)
 
 
-        x = self.ln_post(x)
-        x = self.proj(x)
+        # x = self.ln_post(x)
+        # x = self.proj(x)
 
         if self.audio_bos_eos_token is not None:
             bos = self.audio_bos_eos_token.weight[0][None, :]

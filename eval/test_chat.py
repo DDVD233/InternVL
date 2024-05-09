@@ -14,6 +14,11 @@ from utils.audio_utils import process_audio
 import argparse
 
 
+AUDIO_START_TOKEN = '<audio>'
+AUDIO_END_TOKEN = '</audio>'
+AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
+
+
 def make_grid(images):
     # Reshape the input tensor to (B, 2, 2, H, W, C)
     images = images.view(images.shape[0], 2, 2, images.shape[2], images.shape[3], images.shape[4])
@@ -49,6 +54,8 @@ def main(transcription_on=False):
     model.audio.load_state_dict(torch.load('audio.pth'))
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    tokenizer.add_tokens([AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN], special_tokens=True)
+    model.resize_token_embeddings(len(tokenizer))
 
     categories = ['happy', 'sad', 'neutral', 'angry', 'excited', 'frustrated', 'unknown']
     metrics = {
