@@ -9,7 +9,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch.utils.checkpoint
 from peft import LoraConfig, get_peft_model
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, init
 from transformers import (AutoModel, GenerationConfig, LlamaForCausalLM,
                           LlamaTokenizer)
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -103,14 +103,14 @@ class InternVLChatModel(PreTrainedModel):
             self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.xavier_uniform_(module.weight)
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+        for module in self.mlp2:
+            if isinstance(module, nn.Linear):
+                init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    module.bias.data.fill_(0.01)
 
     def to_type(self, dtype):
-        self.vision_model.type(dtype)
+        self.vision_model.to(dtype)
         self.language_model.to(dtype)
         self.mlp1.to(dtype)
         self.mlp2.to(dtype)
@@ -118,10 +118,11 @@ class InternVLChatModel(PreTrainedModel):
         return self
 
     def to_gpu(self):
-        # self.vision_model.cuda()
-        self.language_model.cuda()
-        self.mlp1.cuda()
-        self.mlp2.cuda()
+        self.vision_model.to(self.gpu1)
+        self.audio.to(self.gpu1)
+        self.language_model.to(self.gpu0)
+        self.mlp1.to(self.gpu1)
+        self.mlp2.to(self.gpu1)
         return self
 
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
@@ -339,7 +340,7 @@ class InternVLChatModel(PreTrainedModel):
             audio_span_tokens = audio_info["audio_span_tokens"]
             input_audio_lengths = audio_info["input_audio_lengths"]
             audio_features = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)[0]
-            audio_features = audio_features.to(self.device).to(self._dtype)
+            audio_features = audio_features.to(self._dtype)
             audio_features = self.mlp2(audio_features)
         else:
             audio_features = None
@@ -349,7 +350,7 @@ class InternVLChatModel(PreTrainedModel):
             history = []
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_bs + IMG_END_TOKEN
             if audio_features is not None:
-                audio_tokens = AUDIO_START_TOKEN + AUDIO_CONTEXT_TOKEN * audio_features.size(1) + AUDIO_END_TOKEN
+                audio_tokens = AUDIO_START_TOKEN + AUDIO_CONTEXT_TOKEN * audio_features.size(0) + AUDIO_END_TOKEN
                 image_tokens += '\n' + audio_tokens
             question = image_tokens + '\n' + question
         else:

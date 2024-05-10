@@ -74,7 +74,7 @@ def main(transcription_on=False):
         os.makedirs(output_path)
 
     for index, sample in enumerate(data_loader):
-        frames: List[numpy.ndarray] = sample['frames']  # 4, H, W, C
+        frames: List[numpy.ndarray] = sample['frames'][:, :2]  # 1, 2, H, W, C
         audio_path = sample['audio_path'][0]
         processed_audio = process_audio(audio_path)
 

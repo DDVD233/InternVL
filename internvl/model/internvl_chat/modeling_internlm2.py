@@ -1063,7 +1063,7 @@ class InternLM2ForCausalLM(InternLM2PreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.output(hidden_states)
-        logits = logits.float()
+        # logits = logits.float()
 
         loss = None
         if labels is not None:
