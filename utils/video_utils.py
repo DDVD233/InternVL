@@ -1,6 +1,7 @@
 from typing import List
 
 import cv2
+import numpy
 import torch
 from torchvision.transforms.functional import InterpolationMode
 
@@ -116,3 +117,17 @@ def process_image(image, input_size=448, max_num=6):
     pixel_values = [transform(image) for image in images]
     pixel_values = torch.stack(pixel_values)
     return pixel_values
+
+
+def make_grid(images: numpy.ndarray):
+    # Make a grid of images
+    num_images = len(images)
+    num_cols = 2
+    num_rows = (num_images + 1) // num_cols
+    grid = numpy.zeros((num_rows * images[0].shape[0], num_cols * images[0].shape[1], 3), dtype=numpy.uint8)
+    for i, image in enumerate(images):
+        row = i // num_cols
+        col = i % num_cols
+        grid[row * images[0].shape[0]:(row + 1) * images[0].shape[0],
+        col * images[0].shape[1]:(col + 1) * images[0].shape[1]] = image
+    return grid
