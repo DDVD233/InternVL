@@ -6,7 +6,8 @@ import numpy as np
 import torch.nn.functional as F
 from PIL import Image
 
-from utils.video_utils import sample_frames, process_image
+from utils.video_utils import sample_frames, process_image, make_grid
+
 
 class IemocapDataset(object):
     """
@@ -139,8 +140,12 @@ class IemocapDataset(object):
         start = self.df.loc[idx, 'start']
         end = self.df.loc[idx, 'end']
         frames = sample_frames(video_name, num_frames=4, start=start, end=end)
-        frames = [process_image(Image.fromarray(frame)) for frame in frames]
-        frames = torch.cat(frames)
+        grid = make_grid(frames)
+        grid = np.array(grid)
+        raw_frames = grid
+        frames = process_image(Image.fromarray(grid))
+        # frames = [process_image(Image.fromarray(frame)) for frame in frames]
+        # frames = torch.cat(frames)
         transcription = self.df.loc[idx, 'transcription']
 
         sample = {
@@ -148,6 +153,7 @@ class IemocapDataset(object):
             'video_path': video_name,
             'transcription': transcription,
             'frames': frames,
+            'raw_frames': raw_frames,
             'start': start,
             'end': end,
             'waveform': waveform,
