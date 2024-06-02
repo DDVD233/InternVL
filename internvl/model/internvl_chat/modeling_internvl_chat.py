@@ -161,6 +161,9 @@ class InternVLChatModel(PreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            audios=None,
+            audio_span_tokens=None,
+            input_audio_lengths=None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -188,6 +191,21 @@ class InternVLChatModel(PreTrainedModel):
                   f'vit_embeds.shape={vit_embeds.shape}')
             n_token = selected.sum()
             input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
+
+        if audios is not None:
+            audio_features = self.audio.encode(audios, input_audio_lengths, audio_span_tokens)
+            audio_features = audio_features.to(self._dtype)
+            audio_features = self.mlp2(audio_features)
+
+            selected = (input_ids == self.audio_context_token_id)
+            try:
+                input_embeds[selected] = input_embeds[selected] * 0.0 + audio_features.reshape(-1, C)
+            except Exception as e:
+                audio_features = audio_features.reshape(-1, C)
+                print(f'warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, '
+                      f'vit_embeds.shape={audio_features.shape}')
+                n_token = selected.sum()
+                input_embeds[selected] = input_embeds[selected] * 0.0 + audio_features[:n_token]
 
         input_embeds = input_embeds.reshape(B, N, C)
 
