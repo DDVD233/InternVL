@@ -41,6 +41,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
+from utils.audio_utils import process_audio
 
 # Upgrade transformers to v4.36.2, we don't need it anymore
 # replace_llama2_attn_with_flash_attn()
@@ -66,6 +67,10 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+
+AUDIO_START_TOKEN = '<audio>'
+AUDIO_END_TOKEN = '</audio>'
+AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
 
 
 @dataclass
@@ -293,6 +298,10 @@ class LazySupervisedDataset(Dataset):
                                         image_size=self.image_size, use_thumbnail=self.use_thumbnail)
         else:
             images = [image]
+
+        audio_path = data_item['audio_path']
+        processed_audio = process_audio(audio_path)
+
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
         num_patches = pixel_values.size(0)
@@ -484,7 +493,7 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
@@ -502,7 +511,7 @@ def main():
         config.ps_version = model_args.ps_version
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
-        model = InternVLChatModel.from_pretrained(
+        model: InternVLChatModel = InternVLChatModel.from_pretrained(
             model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
     else:
         logger.info('Loading ViT-6B...')
@@ -526,7 +535,7 @@ def main():
             max_dynamic_patch=data_args.max_dynamic_patch)
         internvl_chat_config.force_image_size = data_args.force_image_size
         logger.info('Building InternVLChatModel...')
-        model = InternVLChatModel(internvl_chat_config, vision_model, llm)
+        model: InternVLChatModel = InternVLChatModel(internvl_chat_config, vision_model, llm)
     model.img_context_token_id = img_context_token_id
     model.neftune_alpha = data_args.neftune_alpha
 
@@ -580,6 +589,7 @@ def main():
     if model_args.freeze_backbone:
         # model.vision_model = model.vision_model.eval()
         _freeze_params(model.vision_model)
+        _freeze_params(model.audio)
 
     if model_args.freeze_llm:
         model.language_model = model.language_model.eval()
