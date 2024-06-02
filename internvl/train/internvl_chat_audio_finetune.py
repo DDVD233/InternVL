@@ -300,7 +300,11 @@ class LazySupervisedDataset(Dataset):
             images = [image]
 
         audio_path = data_item['audio_path']
-        processed_audio = process_audio(audio_path)
+        audio_info = process_audio(audio_path)
+
+        audios = audio_info["input_audios"]
+        audio_span_tokens = audio_info["audio_span_tokens"]
+        input_audio_lengths = audio_info["input_audio_lengths"]
 
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
@@ -314,8 +318,9 @@ class LazySupervisedDataset(Dataset):
         else:
             preprocess_function = preprocess
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, self.num_image_token * num_patches,
+                                  self.tokenizer, self.num_image_token * num_patches, num_audio_token=0,
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
+
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],

@@ -15,7 +15,7 @@ from torchvision.transforms.functional import InterpolationMode
 
 from .constants import (CLIP_MEAN, CLIP_STD, IMAGENET_MEAN, IMAGENET_STD,
                         IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN,
-                        SIGLIP_MEAN, SIGLIP_STD)
+                        SIGLIP_MEAN, SIGLIP_STD, AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN)
 
 try:
     from petrel_client.client import Client
@@ -116,6 +116,7 @@ def preprocess(
         sources,
         tokenizer: transformers.PreTrainedTokenizer,
         num_image_token: int,
+        num_audio_token: int = 0,
         text_only: bool = False,
         group_by_length: bool = False,
         ds_name: str = None
@@ -139,7 +140,8 @@ def preprocess(
             conv.append_message(role, sentence['value'])
         conversations.append(conv.get_prompt())
 
-    image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token}{IMG_END_TOKEN}'
+    image_tokens = (f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token}{IMG_END_TOKEN}'
+                    f'{AUDIO_START_TOKEN}{AUDIO_CONTEXT_TOKEN * num_audio_token}{AUDIO_END_TOKEN}')
     new_conversations = []
     for conversation in conversations:
         conversation = conversation.replace('<image>', image_tokens)
@@ -219,6 +221,7 @@ def preprocess_mpt(
         sources,
         tokenizer: transformers.PreTrainedTokenizer,
         num_image_token: int,
+        num_audio_token: int = 0,
         text_only: bool = False,
         group_by_length: bool = False,
         ds_name: str = None
@@ -242,7 +245,8 @@ def preprocess_mpt(
             conv.append_message(role, sentence['value'])
         conversations.append(conv.get_prompt())
 
-    image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token}{IMG_END_TOKEN}'
+    image_tokens = (f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token}{IMG_END_TOKEN}'
+                    f'{AUDIO_START_TOKEN}{AUDIO_CONTEXT_TOKEN * num_audio_token}{AUDIO_END_TOKEN}')
     new_conversations = []
     for conversation in conversations:
         conversation = conversation.replace('<image>', image_tokens)
@@ -308,6 +312,7 @@ def preprocess_internlm(
         sources,
         tokenizer: transformers.PreTrainedTokenizer,
         num_image_token: int,
+        num_audio_token: int = 0,
         text_only: bool = False,
         group_by_length: bool = False,
         ds_name: str = None
@@ -334,7 +339,8 @@ def preprocess_internlm(
             conv.append_message(role, sentence['value'])
         conversations.append(conv.get_prompt())
 
-    image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token}{IMG_END_TOKEN}'
+    image_tokens = (f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token}{IMG_END_TOKEN}'
+                    f'{AUDIO_START_TOKEN}{AUDIO_CONTEXT_TOKEN * num_audio_token}{AUDIO_END_TOKEN}')
     new_conversations = []
     for conversation in conversations:
         conversation = conversation.replace('<image>', image_tokens)
