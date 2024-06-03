@@ -32,15 +32,21 @@ def main(transcription_on=False):
     length = len(data_loader)
     # path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
     path = "OpenGVLab/InternVL-Chat-V1-5"
+
+    device_map = {
+        'audio': 1,
+        'vision_model': 1,
+        'mlp1': 1,
+        'mlp2': 1,
+        'language_model': 0,
+    }
     # load in bfloat16
     model: InternVLChatModel = InternVLChatModel.from_pretrained(
         path,
-        low_cpu_mem_usage=False,
+        low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
+        device_map=device_map
     ).eval()
-    model.to_gpu()
-    # model.to_type(torch.bfloat16)
-    # model = model.cuda()
     model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
     model.template = 'internvl_zh'
 
