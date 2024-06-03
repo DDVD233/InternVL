@@ -63,7 +63,7 @@ def main(transcription_on=False):
     for index, sample in enumerate(data_loader):
         frames: List[numpy.ndarray] = sample['frames'][0]  # 2H, 2W, C
         audio_path = sample['audio_path'][0]
-        # processed_audio = process_audio(audio_path)
+        processed_audio = process_audio(audio_path)
 
         generation_config = dict(
             num_beams=1,
@@ -78,7 +78,7 @@ def main(transcription_on=False):
                      "Using both the frames and the transcription, answer with one word from the following: "
                      "happy, sad, neutral, angry, excited, and frustrated.")
 
-        response = model.chat(tokenizer, frames, question, generation_config, audio_info=None)
+        response = model.chat(tokenizer, frames, question, generation_config, audio_info=processed_audio)
         # print('-' * 50)
         target = sample['emotion_str'][0]
         print(f'Response: {response}, Target: {target}. The answer is correct: {response == target}')
