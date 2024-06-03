@@ -41,6 +41,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
+from utils.audio_utils import process_audio
 
 # Upgrade transformers to v4.36.2, we don't need it anymore
 # replace_llama2_attn_with_flash_attn()
@@ -66,6 +67,10 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+
+AUDIO_START_TOKEN = '<audio>'
+AUDIO_END_TOKEN = '</audio>'
+AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
 
 
 @dataclass
@@ -132,6 +137,10 @@ class ModelArguments:
     drop_path_rate: float = field(
         default=0.0,
         metadata={'help': 'Set the drop path rate for the ViT model. Default is 0.'},
+    )
+    image_fold: int = field(
+        default=None,
+        metadata={'help': 'Specify the fold number for the high-resolution image. Default is None.'},
     )
     ps_version: str = field(
         default='v1',
@@ -289,6 +298,16 @@ class LazySupervisedDataset(Dataset):
                                         image_size=self.image_size, use_thumbnail=self.use_thumbnail)
         else:
             images = [image]
+
+        audio_path = data_item['audio_path']
+        # Audio is located at self.root/../audio_path
+        audio_path = os.path.join(os.path.dirname(self.root), audio_path)
+        audio_info = process_audio(audio_path)
+
+        audios = audio_info["input_audios"]
+        audio_span_tokens = audio_info["audio_span_tokens"]
+        input_audio_lengths = audio_info["input_audio_lengths"]
+
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
         num_patches = pixel_values.size(0)
@@ -301,14 +320,18 @@ class LazySupervisedDataset(Dataset):
         else:
             preprocess_function = preprocess
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, self.num_image_token * num_patches,
+                                  self.tokenizer, self.num_image_token * num_patches, num_audio_token=input_audio_lengths,
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
+
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            audios=audios,
+            audio_span_tokens=audio_span_tokens,
+            input_audio_lengths=input_audio_lengths
         )
         return ret
 
@@ -480,7 +503,7 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
@@ -489,18 +512,16 @@ def main():
         logger.info('Loading InternVLChatModel...')
         config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
         config.vision_config.drop_path_rate = model_args.drop_path_rate
-        if 'internlm' in model_args.model_name_or_path.lower():
-            config.llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
-        else:
-            config.llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+        config.llm_config.attn_implementation = 'flash_attention_2'
         config.template = data_args.conv_style
         config.select_layer = model_args.vision_select_layer
+        config.image_fold = model_args.image_fold
         config.dynamic_image_size = data_args.dynamic_image_size
         config.use_thumbnail = data_args.use_thumbnail
         config.ps_version = model_args.ps_version
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
-        model = InternVLChatModel.from_pretrained(
+        model: InternVLChatModel = InternVLChatModel.from_pretrained(
             model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
     else:
         logger.info('Loading ViT-6B...')
@@ -510,10 +531,7 @@ def main():
             model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config)
         logger.info('Loading LLaMA...')
         llm_config = AutoConfig.from_pretrained(model_args.llm_path, trust_remote_code=True)
-        if 'internlm' in model_args.llm_path.lower():
-            llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
-        else:
-            llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+        llm_config.attn_implementation = 'flash_attention_2'
         llm = AutoModelForCausalLM.from_pretrained(
             model_args.llm_path, torch_dtype=torch.bfloat16,
             config=llm_config, trust_remote_code=True)
@@ -521,12 +539,13 @@ def main():
         internvl_chat_config = InternVLChatConfig(
             vision_config.to_dict(), llm_config.to_dict(), downsample_ratio=data_args.down_sample_ratio,
             pad2square=data_args.pad2square, template=data_args.conv_style,
-            select_layer=model_args.vision_select_layer, dynamic_image_size=data_args.dynamic_image_size,
-            use_thumbnail=data_args.use_thumbnail, ps_version=model_args.ps_version,
-            min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch)
+            select_layer=model_args.vision_select_layer, image_fold=model_args.image_fold,
+            dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
+            ps_version=model_args.ps_version, min_dynamic_patch=data_args.min_dynamic_patch,
+            max_dynamic_patch=data_args.max_dynamic_patch)
         internvl_chat_config.force_image_size = data_args.force_image_size
         logger.info('Building InternVLChatModel...')
-        model = InternVLChatModel(internvl_chat_config, vision_model, llm)
+        model: InternVLChatModel = InternVLChatModel(internvl_chat_config, vision_model, llm)
     model.img_context_token_id = img_context_token_id
     model.neftune_alpha = data_args.neftune_alpha
 
@@ -580,6 +599,7 @@ def main():
     if model_args.freeze_backbone:
         # model.vision_model = model.vision_model.eval()
         _freeze_params(model.vision_model)
+        _freeze_params(model.audio)
 
     if model_args.freeze_llm:
         model.language_model = model.language_model.eval()

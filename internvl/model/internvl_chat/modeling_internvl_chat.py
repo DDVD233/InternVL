@@ -292,48 +292,6 @@ class InternVLChatModel(PreTrainedModel):
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
-    def batch_chat(self, tokenizer, pixel_values, image_counts, questions, generation_config, history=None,
-                   return_history=False, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>',
-                   IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
-        if history is not None or return_history:
-            print("Now multi-turn chat is not supported in batch_chat.")
-            raise NotImplementedError
-        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-        self.img_context_token_id = img_context_token_id
-        if tokenizer.convert_tokens_to_ids('<|im_end|>') != 0:
-            eos_token_id = tokenizer.convert_tokens_to_ids('<|im_end|>')  # 92542, InternLM2
-        else:
-            eos_token_id = tokenizer.eos_token_id
-
-        from internvl.conversation import get_conv_template
-
-        queries = []
-        image_bs = pixel_values.shape[0]
-        # print(f'dynamic ViT batch size: {image_bs}, image_counts: {image_counts}')
-        for idx, image_count in enumerate(image_counts):
-            image_token = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * image_count + IMG_END_TOKEN
-            question = image_token + '\n' + questions[idx]
-            template = get_conv_template(self.template)
-            template.append_message(template.roles[0], question)
-            template.append_message(template.roles[1], None)
-            query = template.get_prompt()
-            queries.append(query)
-        tokenizer.padding_side = 'left'
-        model_inputs = tokenizer(queries, return_tensors='pt', padding=True)
-        input_ids = model_inputs['input_ids'].cuda()
-        attention_mask = model_inputs['attention_mask'].cuda()
-        generation_config['eos_token_id'] = eos_token_id
-
-        generation_output = self.generate(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **generation_config
-        )
-        responses = tokenizer.batch_decode(generation_output, skip_special_tokens=True)
-        responses = [response.split('<|im_end|>')[0].strip() for response in responses]  # for InternLM2
-        return responses
-
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
              IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', audio_info=None):
         AUDIO_START_TOKEN = '<audio>'
