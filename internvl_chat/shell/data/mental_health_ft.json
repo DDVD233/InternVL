@@ -5,5 +5,12 @@
     "data_augment": false,
     "repeat_time": 1,
     "length": 9989
+  },
+  "meld_transcript": {
+    "root": "/home/data/datasets/meld/",
+    "annotation": "/home/data/datasets/meld/annotations_with_transcript.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 9989
   }
 }

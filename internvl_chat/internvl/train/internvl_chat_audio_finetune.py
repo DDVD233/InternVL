@@ -262,7 +262,7 @@ class LazySupervisedDataset(Dataset):
                             conversations, return_tensors='pt', padding=False, truncation=False,
                         ).input_ids.size(1)
                         self.conv2length[str_length] = token_length + num_image_token * (
-                                    max_dynamic_patch + use_thumbnail)
+                                max_dynamic_patch + use_thumbnail)
                     else:
                         token_length = self.conv2length[str_length]
                 self.length.append(token_length)
@@ -312,7 +312,8 @@ class LazySupervisedDataset(Dataset):
         else:
             preprocess_function = preprocess
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, self.num_image_token * num_patches, num_audio_token=audio_span_tokens[0],
+                                  self.tokenizer, self.num_image_token * num_patches,
+                                  num_audio_token=audio_span_tokens[0],
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
         ret = dict(
             input_ids=ret['input_ids'][0],
@@ -499,11 +500,20 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, AUDIO_START_TOKEN, AUDIO_END_TOKEN,
+                  AUDIO_CONTEXT_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     audio_context_token_id = tokenizer.convert_tokens_to_ids(AUDIO_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
+
+    device_map = {
+        'audio': 1,
+        'vision_model': 1,
+        'mlp1': 1,
+        'mlp2': 1,
+        'language_model': 0,
+    }
 
     if model_args.model_name_or_path is not None:
         logger.info('Loading InternVLChatModel...')
@@ -522,8 +532,10 @@ def main():
         config.ps_version = model_args.ps_version
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
+        # config.downsample_ratio = data_args.down_sample_ratio
         model: InternVLChatModel = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config,
+            low_cpu_mem_usage=True, device_map=device_map)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -859,7 +871,6 @@ def test_dataset():
                 data[k] = v.cuda()
         output = model(**data)
         print(output)
-
 
 
 if __name__ == '__main__':
