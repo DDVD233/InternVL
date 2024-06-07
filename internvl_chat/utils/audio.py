@@ -424,7 +424,11 @@ class AudioEncoder(nn.Module):
             bos, eos = None, None
         return x, bos, eos
 
-    def encode(self, input_audios: Tensor, input_audio_lengths: Tensor, audio_span_tokens: List):
+    def encode(self, input_audios: Tensor, input_audio_lengths: Tensor, audio_span_tokens: Tensor):
+        if input_audios.dim() == 4:
+            input_audios = input_audios.squeeze(1)
+            input_audio_lengths = input_audio_lengths.squeeze(1)
+            audio_span_tokens = audio_span_tokens.squeeze(1)
         real_input_audio_lens = input_audio_lengths[:, 0].tolist()
         max_len_in_batch = max(real_input_audio_lens)
         padding_mask = torch.ones([input_audios.size(0), max_len_in_batch]).to(dtype=self.conv1.weight.dtype,

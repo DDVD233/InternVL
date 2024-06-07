@@ -42,6 +42,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 from utils.audio_utils import process_audio
+import traceback
 
 # Upgrade transformers to v4.37.2, we don't need it anymore
 # replace_llama2_attn_with_flash_attn()
@@ -311,7 +312,7 @@ class LazySupervisedDataset(Dataset):
         else:
             preprocess_function = preprocess
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, self.num_image_token * num_patches, num_audio_token=input_audio_lengths,
+                                  self.tokenizer, self.num_image_token * num_patches, num_audio_token=audio_span_tokens[0],
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
         ret = dict(
             input_ids=ret['input_ids'][0],
@@ -367,6 +368,7 @@ class LazySupervisedDataset(Dataset):
                 break
             except Exception as e:
                 print(e)
+                print(traceback.print_exc())
                 data_item = json.loads(self.raw_data[i])
                 if 'image' in data_item:
                     if data_item['image'].startswith('s3://'):
@@ -500,6 +502,7 @@ def main():
                   REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+    audio_context_token_id = tokenizer.convert_tokens_to_ids(AUDIO_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
 
     if model_args.model_name_or_path is not None:
@@ -549,6 +552,7 @@ def main():
         logger.info('Building InternVLChatModel...')
         model: InternVLChatModel = InternVLChatModel(internvl_chat_config, vision_model, llm)
     model.img_context_token_id = img_context_token_id
+    model.audio_context_token_id = audio_context_token_id
     model.neftune_alpha = data_args.neftune_alpha
 
     if model_args.mlp_path is not None:
@@ -585,6 +589,7 @@ def main():
     model.language_model.config.use_cache = False
     model.vision_model.gradient_checkpointing = True
     model.vision_model.encoder.gradient_checkpointing = True
+    model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
     if model_args.grad_checkpoint:
         model.language_model._set_gradient_checkpointing()
 
@@ -668,5 +673,195 @@ def main():
         trainer.save_state()
 
 
+def test_dataset():
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
+        # If we pass only one argument to the script, and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    max_dynamic_patch = 12
+    # Setup logging
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        datefmt='%m/%d/%Y %H:%M:%S',
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    if training_args.should_log:
+        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
+        transformers.utils.logging.set_verbosity_info()
+
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    set_verbosity(log_level)
+    enable_default_handler()
+    enable_explicit_format()
+
+    # Log on each process the small summary:
+    logger.warning(
+        f'Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}'
+        + f'distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}'
+    )
+    logger.info(f'Training/evaluation parameters {training_args}')
+
+    # Detecting last checkpoint and eventually continue from last checkpoint.
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f'Output directory ({training_args.output_dir}) already exists and is not empty. '
+                'Use --overwrite_output_dir to overcome.'
+            )
+        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(
+                f'Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change '
+                'the `--output_dir` or add `--overwrite_output_dir` to train from scratch.'
+            )
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+
+    # Load pretrained model, tokenizer, and image processor
+    tokenizer_path = model_args.model_name_or_path or model_args.llm_path
+    logger.info(f'Loading Tokenizer: {tokenizer_path}')
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path, add_eos_token=False, trust_remote_code=True, use_fast=False)
+    tokenizer.tokenizer_path = tokenizer_path
+    tokenizer.model_max_length = data_args.max_seq_length
+    token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
+                  QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, AUDIO_START_TOKEN, AUDIO_END_TOKEN,
+                  AUDIO_CONTEXT_TOKEN]
+    num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
+    img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+    tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
+
+    if model_args.model_name_or_path is not None:
+        logger.info('Loading InternVLChatModel...')
+        config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
+        config.vision_config.drop_path_rate = model_args.drop_path_rate
+        if config.llm_config.model_type == 'internlm2':
+            config.llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
+            logger.info('Using flash_attention_2 for InternLM')
+        else:
+            config.llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+            logger.info('Using flash_attention_2 for LLaMA')
+        config.template = data_args.conv_style
+        config.select_layer = model_args.vision_select_layer
+        config.dynamic_image_size = data_args.dynamic_image_size
+        config.use_thumbnail = data_args.use_thumbnail
+        config.ps_version = model_args.ps_version
+        config.min_dynamic_patch = data_args.min_dynamic_patch
+        config.max_dynamic_patch = data_args.max_dynamic_patch
+        model: InternVLChatModel = InternVLChatModel.from_pretrained(
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config,
+        ).to(torch.device('cuda:0'))
+    else:
+        logger.info('Loading ViT-6B...')
+        vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
+        vision_config.drop_path_rate = model_args.drop_path_rate
+        vision_model = InternVisionModel.from_pretrained(
+            model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config)
+        logger.info('Loading LLaMA...')
+        llm_config = AutoConfig.from_pretrained(model_args.llm_path, trust_remote_code=True)
+        if llm_config.model_type == 'internlm2':
+            llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
+            logger.info('Using flash_attention_2 for InternLM')
+        else:
+            llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+            logger.info('Using flash_attention_2 for LLaMA')
+        llm = AutoModelForCausalLM.from_pretrained(
+            model_args.llm_path, torch_dtype=torch.bfloat16,
+            config=llm_config, trust_remote_code=True)
+        logger.info('Building InternVLChatConfig...')
+        internvl_chat_config = InternVLChatConfig(
+            vision_config.to_dict(), llm_config.to_dict(), downsample_ratio=data_args.down_sample_ratio,
+            pad2square=data_args.pad2square, template=data_args.conv_style,
+            select_layer=model_args.vision_select_layer, dynamic_image_size=data_args.dynamic_image_size,
+            use_thumbnail=data_args.use_thumbnail, ps_version=model_args.ps_version,
+            min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch)
+        internvl_chat_config.force_image_size = data_args.force_image_size
+        logger.info('Building InternVLChatModel...')
+        model: InternVLChatModel = InternVLChatModel(internvl_chat_config, vision_model, llm)
+    model.img_context_token_id = img_context_token_id
+    model.neftune_alpha = data_args.neftune_alpha
+
+    if model_args.mlp_path is not None:
+        logger.info('Loading pretrained MLP projector...')
+        state_dict = torch.load(model_args.mlp_path, map_location='cpu')
+        message = model.mlp1.load_state_dict(state_dict)
+        logger.info(message)
+    logger.info('Finished')
+
+    patch_size = model.config.vision_config.patch_size
+    logger.info(f'model.config.force_image_size: {model.config.force_image_size}')
+    logger.info(f'data_args.force_image_size: {data_args.force_image_size}')
+    logger.info(f'model.config.vision_config.image_size: {model.config.vision_config.image_size}')
+    if model.config.vision_config.image_size != data_args.force_image_size:
+        logger.info(f'Resizing position embedding from '
+                    f'{model.config.vision_config.image_size} '
+                    f'to {data_args.force_image_size}...')
+        model.vision_model.resize_pos_embeddings(old_size=model.config.vision_config.image_size,
+                                                 new_size=data_args.force_image_size,
+                                                 patch_size=patch_size)
+        model.config.vision_config.image_size = data_args.force_image_size
+    model.config.force_image_size = data_args.force_image_size
+    model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
+
+    if num_new_tokens > 0:
+        model.language_model.resize_token_embeddings(len(tokenizer))
+        output_embeddings = model.language_model.get_output_embeddings().weight.data
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+        model.config.llm_config.vocab_size = len(tokenizer)
+        model.language_model.config.vocab_size = len(tokenizer)
+
+    model.language_model.config.use_cache = False
+    model.vision_model.gradient_checkpointing = True
+    model.vision_model.encoder.gradient_checkpointing = True
+    if model_args.grad_checkpoint:
+        model.language_model._set_gradient_checkpointing()
+    ds_collections = json.loads(open(data_args.meta_path).read())
+    for ds_name in ds_collections.keys():
+        repeat_time = ds_collections[ds_name]['repeat_time']
+        if 'max_dynamic_patch' in ds_collections[ds_name]:
+            max_num = ds_collections[ds_name]['max_dynamic_patch']
+            logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
+        else:
+            max_num = max_dynamic_patch
+        dataset = LazySupervisedDataset(
+            data_args.conv_style, ds_collections[ds_name],
+            tokenizer,
+            tcs_loader,
+            num_image_token=model.num_image_token,
+            image_size=data_args.force_image_size,
+            is_train=ds_collections[ds_name]['data_augment'],
+            pad2square=data_args.pad2square,
+            group_by_length=training_args.group_by_length,
+            dynamic_image_size=data_args.dynamic_image_size,
+            use_thumbnail=data_args.use_thumbnail,
+            min_dynamic_patch=data_args.min_dynamic_patch,
+            max_dynamic_patch=max_num,
+            repeat_time=repeat_time,
+            normalize_type=data_args.normalize_type,
+        )
+        dataset.ds_name = ds_name
+
+    # test get item
+    for i in range(len(dataset)):
+        data = dataset[i]
+        # move all tensors to cuda
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                data[k] = v.cuda()
+        output = model(**data)
+        print(output)
+
+
+
 if __name__ == '__main__':
+    # test_dataset()
     main()
