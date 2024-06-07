@@ -1,3 +1,4 @@
+import gc
 import logging
 import math
 import os
@@ -28,22 +29,21 @@ from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
                                       REF_START_TOKEN)
 from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     WeightedConcatDataset, build_transform,
-                                    dynamic_preprocess,
-                                    find_closest_aspect_ratio, preprocess,
-                                    preprocess_internlm, preprocess_mpt)
+                                    dynamic_preprocess, preprocess,
+                                    preprocess_internlm, preprocess_mpt,
+                                    preprocess_phi3)
 from internvl.train.trainer_monkey_patch import replace_create_optimizer
 from PIL import Image, ImageFile, PngImagePlugin
 from torch.utils.data import Dataset
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          HfArgumentParser, LlamaConfig, LlamaForCausalLM,
-                          LlamaTokenizer, Trainer, TrainingArguments,
-                          default_data_collator, set_seed)
+                          HfArgumentParser, Trainer, TrainingArguments,
+                          set_seed)
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 from utils.audio_utils import process_audio
 
-# Upgrade transformers to v4.36.2, we don't need it anymore
+# Upgrade transformers to v4.37.2, we don't need it anymore
 # replace_llama2_attn_with_flash_attn()
 replace_llama_rmsnorm_with_fused_rmsnorm()
 replace_train_sampler()
@@ -51,6 +51,7 @@ replace_train_sampler()
 try:
     from petrel_client.client import Client
     from petrel_client.common.config import Config
+
     has_tcs_loader = True
 except ImportError as E:
     print('petrel_client is not installed. Using PIL to load images.')
@@ -138,10 +139,6 @@ class ModelArguments:
         default=0.0,
         metadata={'help': 'Set the drop path rate for the ViT model. Default is 0.'},
     )
-    image_fold: int = field(
-        default=None,
-        metadata={'help': 'Specify the fold number for the high-resolution image. Default is None.'},
-    )
     ps_version: str = field(
         default='v1',
         metadata={'help': 'Specify the version of pixel shuffle implementation. Default is `v1`.'
@@ -199,7 +196,7 @@ class DataTrainingArguments:
         metadata={'help': 'The minimum number of dynamic patches. Default is 1.'},
     )
     max_dynamic_patch: Optional[int] = field(
-        default=6,
+        default=12,
         metadata={'help': 'The maximum number of dynamic patches. Default is 6.'},
     )
     neftune_alpha: Optional[float] = field(
@@ -238,6 +235,7 @@ class LazySupervisedDataset(Dataset):
             if repeat_time < 1:
                 # choice top len(self.raw_data) * repeat_time samples
                 self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
+        gc.collect()
         self.root = meta['root']
         self.cached_data_dict = {}
         self.tcs_loader = tcs_loader
@@ -262,7 +260,8 @@ class LazySupervisedDataset(Dataset):
                         token_length = tokenizer(
                             conversations, return_tensors='pt', padding=False, truncation=False,
                         ).input_ids.size(1)
-                        self.conv2length[str_length] = token_length + num_image_token * (max_dynamic_patch + use_thumbnail)
+                        self.conv2length[str_length] = token_length + num_image_token * (
+                                    max_dynamic_patch + use_thumbnail)
                     else:
                         token_length = self.conv2length[str_length]
                 self.length.append(token_length)
@@ -273,15 +272,6 @@ class LazySupervisedDataset(Dataset):
     def multi_modal_get_item(self, data_item):
         if '<image>' not in data_item['conversations'][0]['value']:
             data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
-
-        # fix bug when there are multiple <image> in conversations
-        image_cnt = 0
-        for idx, conv in enumerate(data_item['conversations']):
-            conv['value'] = conv['value'].replace('<image>\n', '').replace('\n<image>', '').replace('<image>', '')
-            if idx == 0:
-                conv['value'] = '<image>\n' + conv['value']
-            image_cnt += conv['value'].count('<image>')
-        assert image_cnt == 1, f'There should be exactly one <image> in the conversation, but got {image_cnt}'
 
         if data_item['image'].startswith('s3://'):
             image_path = self.root + data_item['image']
@@ -316,12 +306,13 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_mpt
         elif self.template_name == 'internlm2-chat':
             preprocess_function = preprocess_internlm
+        elif self.template_name == 'phi3-chat':
+            preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, self.num_image_token * num_patches, num_audio_token=input_audio_lengths,
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
-
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
@@ -348,6 +339,8 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_mpt
         elif self.template_name == 'internlm2-chat':
             preprocess_function = preprocess_internlm
+        elif self.template_name == 'phi3-chat':
+            preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
@@ -394,8 +387,10 @@ def build_datasets(data_args, tokenizer, tcs_loader, model, group_by_length=Fals
     for ds_name in ds_collections.keys():
         repeat_time = ds_collections[ds_name]['repeat_time']
         if 'max_dynamic_patch' in ds_collections[ds_name]:
-            max_dynamic_patch = ds_collections[ds_name]['max_dynamic_patch']
-            logger.info(f'max_dynamic_patch is set to {max_dynamic_patch} according to the meta file')
+            max_num = ds_collections[ds_name]['max_dynamic_patch']
+            logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
+        else:
+            max_num = max_dynamic_patch
         try:
             dataset = LazySupervisedDataset(
                 data_args.conv_style, ds_collections[ds_name],
@@ -409,7 +404,7 @@ def build_datasets(data_args, tokenizer, tcs_loader, model, group_by_length=Fals
                 dynamic_image_size=dynamic_image_size,
                 use_thumbnail=use_thumbnail,
                 min_dynamic_patch=min_dynamic_patch,
-                max_dynamic_patch=max_dynamic_patch,
+                max_dynamic_patch=max_num,
                 repeat_time=repeat_time,
                 normalize_type=normalize_type,
             )
@@ -511,10 +506,14 @@ def main():
         logger.info('Loading InternVLChatModel...')
         config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
         config.vision_config.drop_path_rate = model_args.drop_path_rate
-        config.llm_config.attn_implementation = 'flash_attention_2'
+        if config.llm_config.model_type == 'internlm2':
+            config.llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
+            logger.info('Using flash_attention_2 for InternLM')
+        else:
+            config.llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+            logger.info('Using flash_attention_2 for LLaMA')
         config.template = data_args.conv_style
         config.select_layer = model_args.vision_select_layer
-        config.image_fold = model_args.image_fold
         config.dynamic_image_size = data_args.dynamic_image_size
         config.use_thumbnail = data_args.use_thumbnail
         config.ps_version = model_args.ps_version
@@ -530,7 +529,12 @@ def main():
             model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config)
         logger.info('Loading LLaMA...')
         llm_config = AutoConfig.from_pretrained(model_args.llm_path, trust_remote_code=True)
-        llm_config.attn_implementation = 'flash_attention_2'
+        if llm_config.model_type == 'internlm2':
+            llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
+            logger.info('Using flash_attention_2 for InternLM')
+        else:
+            llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+            logger.info('Using flash_attention_2 for LLaMA')
         llm = AutoModelForCausalLM.from_pretrained(
             model_args.llm_path, torch_dtype=torch.bfloat16,
             config=llm_config, trust_remote_code=True)
@@ -538,10 +542,9 @@ def main():
         internvl_chat_config = InternVLChatConfig(
             vision_config.to_dict(), llm_config.to_dict(), downsample_ratio=data_args.down_sample_ratio,
             pad2square=data_args.pad2square, template=data_args.conv_style,
-            select_layer=model_args.vision_select_layer, image_fold=model_args.image_fold,
-            dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
-            ps_version=model_args.ps_version, min_dynamic_patch=data_args.min_dynamic_patch,
-            max_dynamic_patch=data_args.max_dynamic_patch)
+            select_layer=model_args.vision_select_layer, dynamic_image_size=data_args.dynamic_image_size,
+            use_thumbnail=data_args.use_thumbnail, ps_version=model_args.ps_version,
+            min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch)
         internvl_chat_config.force_image_size = data_args.force_image_size
         logger.info('Building InternVLChatModel...')
         model: InternVLChatModel = InternVLChatModel(internvl_chat_config, vision_model, llm)
