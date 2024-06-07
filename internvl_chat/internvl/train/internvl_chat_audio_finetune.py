@@ -299,9 +299,8 @@ class LazySupervisedDataset(Dataset):
         else:
             images = [image]
 
-        audio_path = data_item['audio_path']
-        # Audio is located at self.root/../audio_path
-        audio_path = os.path.join(os.path.dirname(self.root), audio_path)
+        audio_path = data_item['audio']
+        audio_path = os.path.join(self.root, audio_path)
         audio_info = process_audio(audio_path)
 
         audios = audio_info["input_audios"]

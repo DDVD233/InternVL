@@ -1,0 +1,9 @@
+{
+  "meld_notranscript": {
+    "root": "/home/data/datasets/meld/",
+    "annotation": "/home/data/datasets/meld/annotations_no_transcript.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 9989
+  }
+}
