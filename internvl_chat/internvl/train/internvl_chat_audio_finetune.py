@@ -271,15 +271,12 @@ class LazySupervisedDataset(Dataset):
         return len(self.raw_data)
 
     def multi_modal_get_item(self, data_item):
-        # if '<image>' not in data_item['conversations'][0]['value']:
-        #     data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
-
-        if data_item['image'].startswith('s3://'):
-            image_path = self.root + data_item['image']
-        else:
-            image_path = os.path.join(self.root, data_item['image'])
-
         if '<image>' in data_item['conversations'][0]['value']:
+            assert 'image' in data_item, f'Image is not found in the data item.'
+            if data_item['image'].startswith('s3://'):
+                image_path = self.root + data_item['image']
+            else:
+                image_path = os.path.join(self.root, data_item['image'])
             if self.tcs_loader is not None:
                 image = self.tcs_loader(image_path)
             else:
@@ -291,13 +288,17 @@ class LazySupervisedDataset(Dataset):
                                             image_size=self.image_size, use_thumbnail=self.use_thumbnail)
             else:
                 images = [image]
+            image_flags = 1
         else:
             images = [Image.new('RGB', (224, 224), (255, 255, 255))]
             transform = build_transform(is_train=self.is_train, input_size=self.image_size,
                                         pad2square=self.pad2square, normalize_type=self.normalize_type)
+            image_flags = 0
+
 
 
         if '<audio>' in data_item['conversations'][0]['value']:
+            assert 'audio' in data_item, f'Audio is not found in the data item.'
             audio_path = data_item['audio']
             audio_path = os.path.join(self.root, audio_path)
             audio_info = process_audio(audio_path)
@@ -305,14 +306,17 @@ class LazySupervisedDataset(Dataset):
             audios = audio_info["input_audios"]
             audio_span_tokens = audio_info["audio_span_tokens"]
             input_audio_lengths = audio_info["input_audio_lengths"]
+            audio_flags = torch.tensor([1] * audio_span_tokens[0], dtype=torch.long)
         else:
-            audios = torch.zeros(1, 80, 300, dtype=torch.float32)
+            audios = torch.ones(1, 80, 300, dtype=torch.float32)
             audio_span_tokens = [1]
-            input_audio_lengths = [1, 1]
+            input_audio_lengths = torch.LongTensor([[2, 1]])
+            audio_flags = torch.tensor([0] * audio_span_tokens[0], dtype=torch.long)
 
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
         num_patches = pixel_values.size(0)
+        image_flags = torch.tensor([image_flags] * num_patches, dtype=torch.long)
         if not self.dynamic_image_size:
             assert num_patches == 1, f'The number of patches should be 1, but got {num_patches}.'
         if self.template_name == 'Hermes-2':
@@ -323,6 +327,8 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
+        if audio_span_tokens[0] == 0:
+            print(f'audio_span_tokens is 0, the dataset is: {self.ds_name}')
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, self.num_image_token * num_patches,
                                   num_audio_token=audio_span_tokens[0],
@@ -332,7 +338,8 @@ class LazySupervisedDataset(Dataset):
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            image_flags=image_flags,
+            audio_flags=audio_flags,
             audios=audios,
             audio_span_tokens=audio_span_tokens,
             input_audio_lengths=input_audio_lengths
@@ -347,6 +354,11 @@ class LazySupervisedDataset(Dataset):
                                     pad2square=self.pad2square, normalize_type=self.normalize_type)
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
+
+        audios = torch.ones(1, 80, 300, dtype=torch.float32)
+        audio_span_tokens = [1]
+        input_audio_lengths = torch.LongTensor([[2, 1]])
+
         num_patches = pixel_values.size(0)
         assert num_patches == 1, f'The number of patches should be 1, but got {num_patches}.'
         if self.template_name == 'Hermes-2':
@@ -357,15 +369,21 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
+        if audio_span_tokens[0] == 0:
+            print(f'audio_span_tokens is 0, the dataset is: {self.ds_name}')
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, self.num_image_token * num_patches, text_only=True,
+                                  self.tokenizer, self.num_image_token * num_patches, num_audio_token=audio_span_tokens[0], text_only=True,
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([0] * num_patches, dtype=torch.long)
+            image_flags=torch.tensor([0] * num_patches, dtype=torch.long),
+            audio_flags=torch.tensor([0] * audio_span_tokens[0], dtype=torch.long),
+            audios=audios,
+            audio_span_tokens=audio_span_tokens,
+            input_audio_lengths=input_audio_lengths
         )
         return ret
 
@@ -880,10 +898,10 @@ def test_dataset():
         for k, v in data.items():
             if isinstance(v, torch.Tensor):
                 data[k] = v.cuda()
-        output = model(**data)
-        print(output)
+        # output = model(**data)
+        # print(output)
 
 
 if __name__ == '__main__':
-    test_dataset()
+    # test_dataset()
     main()

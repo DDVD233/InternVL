@@ -98,7 +98,7 @@ def concat_pad_data_collator(features, max_item_length=None, pad_id=0):
     # Handling of all other possible keys.
     # Again, we will use the first element to figure out which key/values are not None for this model.
     for k, v in first.items():
-        if k not in ('label', 'label_ids', 'pixel_values', 'image_flags') and \
+        if k not in ('label', 'label_ids', 'pixel_values', 'image_flags', 'audio_flags') and \
                 v is not None and not isinstance(v, str):
             if isinstance(v, torch.Tensor):
                 batch[k] = torch.stack([f[k] for f in features])
@@ -106,7 +106,7 @@ def concat_pad_data_collator(features, max_item_length=None, pad_id=0):
                 batch[k] = torch.tensor(np.stack([f[k] for f in features]))
             else:
                 batch[k] = torch.tensor([f[k] for f in features])
-        if k in ('pixel_values', 'image_flags'):
+        if k in ('pixel_values', 'image_flags', 'audio_flags'):
             if isinstance(v, torch.Tensor):
                 batch[k] = torch.concat([f[k] for f in features])
             elif isinstance(v, np.ndarray):
