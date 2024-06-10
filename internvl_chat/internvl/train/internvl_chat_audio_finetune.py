@@ -271,32 +271,44 @@ class LazySupervisedDataset(Dataset):
         return len(self.raw_data)
 
     def multi_modal_get_item(self, data_item):
-        if '<image>' not in data_item['conversations'][0]['value']:
-            data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
+        # if '<image>' not in data_item['conversations'][0]['value']:
+        #     data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
 
         if data_item['image'].startswith('s3://'):
             image_path = self.root + data_item['image']
         else:
             image_path = os.path.join(self.root, data_item['image'])
-        if self.tcs_loader is not None:
-            image = self.tcs_loader(image_path)
-        else:
-            image = Image.open(image_path).convert('RGB')
-        transform = build_transform(is_train=self.is_train, input_size=self.image_size,
-                                    pad2square=self.pad2square, normalize_type=self.normalize_type)
-        if self.dynamic_image_size:
-            images = dynamic_preprocess(image, min_num=self.min_dynamic_patch, max_num=self.max_dynamic_patch,
-                                        image_size=self.image_size, use_thumbnail=self.use_thumbnail)
-        else:
-            images = [image]
 
-        audio_path = data_item['audio']
-        audio_path = os.path.join(self.root, audio_path)
-        audio_info = process_audio(audio_path)
+        if '<image>' in data_item['conversations'][0]['value']:
+            if self.tcs_loader is not None:
+                image = self.tcs_loader(image_path)
+            else:
+                image = Image.open(image_path).convert('RGB')
+            transform = build_transform(is_train=self.is_train, input_size=self.image_size,
+                                        pad2square=self.pad2square, normalize_type=self.normalize_type)
+            if self.dynamic_image_size:
+                images = dynamic_preprocess(image, min_num=self.min_dynamic_patch, max_num=self.max_dynamic_patch,
+                                            image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+            else:
+                images = [image]
+        else:
+            images = [Image.new('RGB', (224, 224), (255, 255, 255))]
+            transform = build_transform(is_train=self.is_train, input_size=self.image_size,
+                                        pad2square=self.pad2square, normalize_type=self.normalize_type)
 
-        audios = audio_info["input_audios"]
-        audio_span_tokens = audio_info["audio_span_tokens"]
-        input_audio_lengths = audio_info["input_audio_lengths"]
+
+        if '<audio>' in data_item['conversations'][0]['value']:
+            audio_path = data_item['audio']
+            audio_path = os.path.join(self.root, audio_path)
+            audio_info = process_audio(audio_path)
+
+            audios = audio_info["input_audios"]
+            audio_span_tokens = audio_info["audio_span_tokens"]
+            input_audio_lengths = audio_info["input_audio_lengths"]
+        else:
+            audios = torch.zeros(1, 80, 300, dtype=torch.float32)
+            audio_span_tokens = [1]
+            input_audio_lengths = [1, 1]
 
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
@@ -362,7 +374,7 @@ class LazySupervisedDataset(Dataset):
         while True:
             try:
                 data_item = json.loads(self.raw_data[i])
-                if 'image' in data_item and len(data_item['image']) != 0:
+                if 'image' in data_item or 'audio' in data_item:
                     ret = self.multi_modal_get_item(data_item)
                 else:
                     ret = self.pure_text_get_item(data_item)
@@ -534,8 +546,7 @@ def main():
         config.max_dynamic_patch = data_args.max_dynamic_patch
         # config.downsample_ratio = data_args.down_sample_ratio
         model: InternVLChatModel = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config,
-            low_cpu_mem_usage=True, device_map=device_map)
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -874,5 +885,5 @@ def test_dataset():
 
 
 if __name__ == '__main__':
-    # test_dataset()
+    test_dataset()
     main()
