@@ -129,6 +129,9 @@ class IemocapDataset(object):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
+        if idx >= len(self.df):
+            return None
+
         audio_name = os.path.join(self.root, self.df.loc[idx, 'audio_file'])
         video_name = os.path.join(self.root, self.df.loc[idx, 'video_file'])
         waveform, sample_rate = torchaudio.load(audio_name)
@@ -144,8 +147,8 @@ class IemocapDataset(object):
         grid = np.array(grid)
         raw_frames = grid
         frames = process_image(Image.fromarray(grid))
-        # frames = [process_image(Image.fromarray(frame)) for frame in frames]
-        # frames = torch.cat(frames)
+        frames = [process_image(Image.fromarray(frame)) for frame in frames]
+        frames = torch.cat(frames)
         transcription = self.df.loc[idx, 'transcription']
 
         sample = {

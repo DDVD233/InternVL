@@ -4,13 +4,20 @@
     "annotation": "/home/data/datasets/meld/annotations_no_transcript_diversified.jsonl",
     "data_augment": false,
     "repeat_time": 1,
-    "length": 9989
+    "length": 29967
   },
   "meld_transcript": {
     "root": "/home/data/datasets/meld/",
     "annotation": "/home/data/datasets/meld/annotations_with_transcript_diversified.jsonl",
     "data_augment": false,
     "repeat_time": 1,
-    "length": 9989
+    "length": 29967
+  },
+  "iemocap": {
+    "root": "/home/data/datasets/iemocap/",
+    "annotation": "/home/data/datasets/iemocap/annotations.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 40306
   }
 }
