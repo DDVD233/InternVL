@@ -1,0 +1,9 @@
+{
+  "iemocap": {
+    "root": "/home/data/datasets/iemocap/",
+    "annotation": "/home/data/datasets/iemocap/annotations.jsonl",
+    "data_augment": true,
+    "repeat_time": 1,
+    "length": 40306
+  }
+}
