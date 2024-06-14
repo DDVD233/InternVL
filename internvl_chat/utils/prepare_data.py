@@ -32,7 +32,7 @@ def prepare_iemocap():
         audio_path: str = data['audio_path']
 
         # Save image
-        image_name = f"{i}.jpg"
+        image_name = f"{i}.png"
         # skip if exists
         if not os.path.exists(os.path.join(image_path, image_name)):
             frames: numpy.ndarray = data['raw_frames']
@@ -53,8 +53,9 @@ def prepare_iemocap():
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"Above are 4 frames and an audio clip from a video. "
+                    "value": f"<image>\n<audio>\nAbove are 4 frames and an audio clip from a video. "
                              f"The speaker said, '{transcription}' What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
@@ -70,8 +71,9 @@ def prepare_iemocap():
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"Above are 4 frames from a video. "
+                    "value": f"<image>\nAbove are 4 frames from a video. "
                              f"The speaker said, '{transcription}' What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
@@ -87,8 +89,9 @@ def prepare_iemocap():
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"Above is an audio clip from a video. "
+                    "value": f"<audio>\nAbove is an audio clip from a video. "
                              f"The speaker said, '{transcription}' What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
@@ -104,6 +107,7 @@ def prepare_iemocap():
                 {
                     "from": "human",
                     "value": f"The speaker said, '{transcription}' What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
@@ -120,7 +124,8 @@ def prepare_iemocap():
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"Above are 4 frames and an audio clip from a video. What is the emotion of the speaker in this video?"
+                    "value": f"<image>\n<audio>\nAbove are 4 frames and an audio clip from a video. What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
@@ -136,7 +141,8 @@ def prepare_iemocap():
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"Above are 4 frames from a video. What is the emotion of the speaker in this video?"
+                    "value": f"<image>\nAbove are 4 frames from a video. What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
@@ -152,7 +158,8 @@ def prepare_iemocap():
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"Above is an audio clip from a video. What is the emotion of the speaker in this video?"
+                    "value": f"<audio>\nAbove is an audio clip from a video. What is the emotion of the speaker in this video?"
+                             f"\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase."
                 },
                 {
                     "from": "gpt",
