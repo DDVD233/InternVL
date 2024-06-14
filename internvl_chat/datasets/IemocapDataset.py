@@ -1,4 +1,7 @@
 import os
+
+import cv2
+import numpy
 import torch
 import torchaudio
 import pandas as pd
@@ -144,11 +147,18 @@ class IemocapDataset(object):
         end = self.df.loc[idx, 'end']
         frames = sample_frames(video_name, num_frames=4, start=start, end=end)
         grid = make_grid(frames)
-        grid = np.array(grid)
-        raw_frames = grid
+        grid: numpy.ndarray = np.array(grid)
+        # downsize the grid to 1280x720 maximum, but keep the aspect ratio
+        if grid.shape[0] > 720 or grid.shape[1] > 1280:
+            aspect_ratio = grid.shape[1] / grid.shape[0]
+            if aspect_ratio > 1280 / 720:
+                new_width = 1280
+                new_height = int(new_width / aspect_ratio)
+            else:
+                new_height = 720
+                new_width = int(new_height * aspect_ratio)
+            grid = cv2.resize(grid, (new_width, new_height), interpolation=cv2.INTER_AREA)
         frames = process_image(Image.fromarray(grid))
-        frames = [process_image(Image.fromarray(frame)) for frame in frames]
-        frames = torch.cat(frames)
         transcription = self.df.loc[idx, 'transcription']
 
         sample = {
@@ -156,7 +166,7 @@ class IemocapDataset(object):
             'video_path': video_name,
             'transcription': transcription,
             'frames': frames,
-            'raw_frames': raw_frames,
+            'raw_frames': grid,
             'start': start,
             'end': end,
             'waveform': waveform,
