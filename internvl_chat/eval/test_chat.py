@@ -31,7 +31,9 @@ def main(transcription_on=False):
                                               num_workers=8)
     length = len(data_loader)
     # path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
-    path = "OpenGVLab/InternVL-Chat-V1-5"
+    # path = "OpenGVLab/InternVL-Chat-V1-5"
+    # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"
+    path = "/home/data/phi3_iemocap"
 
     device_map = {
         'audio': 1,
@@ -43,18 +45,20 @@ def main(transcription_on=False):
     # load in bfloat16
     model: InternVLChatModel = InternVLChatModel.from_pretrained(
         path,
-        low_cpu_mem_usage=True,
+        # low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
-        device_map=device_map
+        # device_map=device_map
     ).eval()
-    model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
-    model.template = 'internvl_zh'
+    model = model.to('cuda')
+    # model.template = 'internvl_zh'
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-    tokenizer.add_tokens([AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN], special_tokens=True)
-    model.language_model.resize_token_embeddings(len(tokenizer))
+    if 'OpenGVLab' in path:  # vanilla model
+        tokenizer.add_tokens([AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN], special_tokens=True)
+        model.language_model.resize_token_embeddings(len(tokenizer))
+        model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
 
-    categories = ['happy', 'sad', 'neutral', 'angry', 'excited', 'frustrated', 'unknown']
+    categories = ['happy', 'sad', 'neutral', 'angry', 'frustrated', 'unknown']
     metrics = {
         'category_accuracy': Accuracy(task='multiclass', num_classes=len(categories), average='none'),
         'overall_accuracy': Accuracy(task='multiclass', num_classes=len(categories), average='micro'),
@@ -67,26 +71,27 @@ def main(transcription_on=False):
         os.makedirs(output_path)
 
     for index, sample in enumerate(data_loader):
-        frames: List[numpy.ndarray] = sample['frames'][0]  # 2H, 2W, C
+        frames: torch.Tensor = sample['frames'][0]  # 2H, 2W, C
         audio_path = sample['audio_path'][0]
         processed_audio = process_audio(audio_path)
 
         generation_config = dict(
             num_beams=1,
-            max_new_tokens=512,
+            max_new_tokens=50,
             do_sample=False,
         )
 
-        question = "These are 4 frames from a video. "
+        question = "Above are 4 frames and an audio clip from a video. "
         if transcription_on:
-            question += "The speaker said: \"" + sample['transcription'][0] + "\" "
-        question += ("What is the emotion of the speaker? "
-                     "Using both the frames and the transcription, answer with one word from the following: "
-                     "happy, sad, neutral, angry, excited, and frustrated.")
+            question += "The speaker said, '" + sample['transcription'][0] + "'"
+        question += (" What is the emotion of the speaker?"
+                     "\nhappy\nsad\nneutral\nangry\nfrustrated\nAnswer with one word or phrase.")
 
-        response = model.chat(tokenizer, frames, question, generation_config, audio_info=processed_audio)
+        response: str = model.chat(tokenizer, frames.to(model.device), question, generation_config, audio_info=processed_audio)
         # print('-' * 50)
         target = sample['emotion_str'][0]
+        if response.startswith(target):
+            response = target
         print(f'Response: {response}, Target: {target}. The answer is correct: {response == target}')
         # print('-' * 50)
         # fill metrics
