@@ -666,6 +666,7 @@ def main():
 
     if model_args.freeze_mlp:
         _freeze_params(model.mlp1)
+        _freeze_params(model.mlp2)
 
     if model_args.unfreeze_vit_layers != 0:
         layers = model.vision_model.encoder.layers[model_args.unfreeze_vit_layers:]
