@@ -520,6 +520,7 @@ def main():
             )
     # Set seed before initializing model.
     set_seed(training_args.seed)
+    continued_finetune = not ('OpenGVLab' in model_args.model_name_or_path)
 
     # Load pretrained model, tokenizer, and image processor
     tokenizer_path = model_args.model_name_or_path or model_args.llm_path
@@ -536,14 +537,6 @@ def main():
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     audio_context_token_id = tokenizer.convert_tokens_to_ids(AUDIO_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
-
-    device_map = {
-        'audio': 1,
-        'vision_model': 1,
-        'mlp1': 1,
-        'mlp2': 1,
-        'language_model': 0,
-    }
 
     if model_args.model_name_or_path is not None:
         logger.info('Loading InternVLChatModel...')
@@ -564,7 +557,10 @@ def main():
         config.max_dynamic_patch = data_args.max_dynamic_patch
         # config.downsample_ratio = data_args.down_sample_ratio
         model: InternVLChatModel = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            # config=config
+        )
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -630,7 +626,8 @@ def main():
     model.language_model.config.use_cache = False
     model.vision_model.gradient_checkpointing = True
     model.vision_model.encoder.gradient_checkpointing = True
-    model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
+    if not continued_finetune:
+        model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
     if model_args.grad_checkpoint:
         model.language_model._set_gradient_checkpointing()
 
