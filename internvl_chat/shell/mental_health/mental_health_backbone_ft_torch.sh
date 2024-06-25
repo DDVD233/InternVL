@@ -1,0 +1,42 @@
+PYTHONPATH=$PYTHONPATH:./ \
+LAUNCHER=pytorch \
+python -m torch.distributed.launch --nproc_per_node=1 --use-env \
+internvl/train/internvl_chat_audio_finetune.py \
+  --model_name_or_path "OpenGVLab/Mini-InternVL-Chat-4B-V1-5" \
+  --conv_style "phi3-chat" \
+  --output_dir "/home/data/phi3_backbone_all/" \
+  --meta_path "shell/data/mental_health_ft.json" \
+  --overwrite_output_dir True \
+  --force_image_size 448 \
+  --max_dynamic_patch 12 \
+  --down_sample_ratio 0.5 \
+  --drop_path_rate 0.1 \
+  --pad2square False \
+  --freeze_llm True \
+  --freeze_mlp True \
+  --freeze_backbone True \
+  --vision_select_layer -1 \
+  --use_data_resampling False \
+  --dataloader_num_workers 4 \
+  --bf16 True \
+  --num_train_epochs 1 \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 4 \
+  --evaluation_strategy "no" \
+  --save_strategy "steps" \
+  --save_steps 600 \
+  --save_total_limit 3 \
+  --learning_rate 2e-6 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.03 \
+  --lr_scheduler_type "cosine" \
+  --logging_steps 1 \
+  --max_seq_length 8192 \
+  --do_train True \
+  --grad_checkpoint True \
+  --group_by_length True \
+  --dynamic_image_size True \
+  --use_thumbnail True \
+  --ps_version 'v2' \
+  --deepspeed "zero_stage2_config.json" \
+  --report_to wandb \
