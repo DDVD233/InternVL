@@ -107,11 +107,11 @@ def mosei_recover():
 
 
 if __name__ == '__main__':
-    data_path = '/home/data/datasets/meld/'
-    # diversify_data(os.path.join(data_path, 'annotations_with_transcript.jsonl'),
-    #                no_audio=True, no_image=True, no_audio_no_image=True)
+    data_path = '/home/dvd/data/datasets/cmu_mosei/'
+    diversify_data(os.path.join(data_path, 'annotation_train.jsonl'),
+                   no_audio=True, no_image=True, no_audio_no_image=False)
     # diversify_data(os.path.join(data_path, 'annotations_no_transcript.jsonl'),
     #                no_audio=True, no_image=True, no_audio_no_image=False)
-    format_questions(os.path.join(data_path, 'annotations_with_transcript_diversified.jsonl'))
-    format_questions(os.path.join(data_path, 'annotations_no_transcript_diversified.jsonl'))
+    # format_questions(os.path.join(data_path, 'annotations_with_transcript_diversified.jsonl'))
+    # format_questions(os.path.join(data_path, 'annotations_no_transcript_diversified.jsonl'))
     # mosei_recover()

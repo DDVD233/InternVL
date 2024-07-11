@@ -333,9 +333,13 @@ class LazySupervisedDataset(Dataset):
                                   self.tokenizer, self.num_image_token * num_patches,
                                   num_audio_token=audio_span_tokens[0],
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
+        target = data_item['conversations'][-1]['value']
+        question = data_item['conversations'][0]['value']
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
+            target=target,
+            question=question,
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
             image_flags=image_flags,
@@ -374,9 +378,13 @@ class LazySupervisedDataset(Dataset):
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, self.num_image_token * num_patches, num_audio_token=audio_span_tokens[0], text_only=True,
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
+        target = data_item['conversations'][-1]['value']
+        question = data_item['conversations'][0]['value']
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
+            target=target,
+            question=question,
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
             image_flags=torch.tensor([0] * num_patches, dtype=torch.long),

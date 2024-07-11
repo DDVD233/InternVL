@@ -19,5 +19,12 @@
     "data_augment": false,
     "repeat_time": 1,
     "length": 40306
+  },
+  "mosei": {
+    "root": "/home/dvd/data/datasets/cmu_mosei/",
+    "annotation": "/home/dvd/data/datasets/cmu_mosei/annotation_train.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 245538
   }
 }
