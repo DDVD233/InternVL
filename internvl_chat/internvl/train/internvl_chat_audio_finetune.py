@@ -5,6 +5,7 @@ import os
 import random
 import sys
 import warnings
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -145,6 +146,10 @@ class ModelArguments:
         metadata={'help': 'Specify the version of pixel shuffle implementation. Default is `v1`.'
                           'Please use `v2` to fix the bug of transposed image.'}
     )
+    use_class_weights: bool = field(
+        default=False,
+        metadata={'help': 'Set to True to use class weights for the loss function.'},
+    )
 
 
 @dataclass
@@ -236,6 +241,17 @@ class LazySupervisedDataset(Dataset):
             if repeat_time < 1:
                 # choice top len(self.raw_data) * repeat_time samples
                 self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
+
+        self.statistics = defaultdict(int)
+        for data_item in self.raw_data:
+            data_item = json.loads(data_item)
+            target = data_item['conversations'][-1]['value']
+            self.statistics[target] += 1
+
+        # Weight = inverse of frequency, lower frequency, higher weight
+        max_size = max(self.statistics.values())
+        self.statistics = {k: (max_size / v) ** 2 for k, v in self.statistics.items()}
+
         gc.collect()
         self.root = meta['root']
         self.cached_data_dict = {}
@@ -335,6 +351,7 @@ class LazySupervisedDataset(Dataset):
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
         target = data_item['conversations'][-1]['value']
         question = data_item['conversations'][0]['value']
+        weight = self.statistics[target]
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
@@ -346,7 +363,8 @@ class LazySupervisedDataset(Dataset):
             audio_flags=audio_flags,
             audios=audios,
             audio_span_tokens=audio_span_tokens,
-            input_audio_lengths=input_audio_lengths
+            input_audio_lengths=input_audio_lengths,
+            weight=weight
         )
         return ret
 
@@ -380,6 +398,7 @@ class LazySupervisedDataset(Dataset):
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
         target = data_item['conversations'][-1]['value']
         question = data_item['conversations'][0]['value']
+        weight = self.statistics[target]
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
@@ -391,7 +410,8 @@ class LazySupervisedDataset(Dataset):
             audio_flags=torch.tensor([0] * audio_span_tokens[0], dtype=torch.long),
             audios=audios,
             audio_span_tokens=audio_span_tokens,
-            input_audio_lengths=input_audio_lengths
+            input_audio_lengths=input_audio_lengths,
+            weight=weight
         )
         return ret
 

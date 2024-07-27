@@ -1,4 +1,5 @@
 import json
+from collections import defaultdict
 
 import h5py
 import os
@@ -110,6 +111,7 @@ def preprocess_mosei():
     emotions = ['happy', 'sad', 'anger', 'surprise', 'disgust', 'fear']
 
     annotations = []
+    counts = defaultdict(int)
 
     with h5py.File(label_path, 'r') as f:
         data = f['All Labels']['data']
@@ -177,6 +179,7 @@ def preprocess_mosei():
                         {'from': 'gpt', 'value': sentiment_str}
                     ]
                 })
+                counts[sentiment_str] += 1
 
                 strongest_emotion_index = np.argmax(label[1:])
                 strongest_emotion = emotions[strongest_emotion_index]
@@ -208,37 +211,40 @@ def preprocess_mosei():
                         ]
                     })
 
-                for emotion, value in zip(emotions, label[1:]):
-                    if value >= 1:
-                        binary_emotion_suffix = ('Is the speaker feeling ' + emotion + ' in this video?\n'
-                                                'yes\nno\n'
-                                                'Answer with one word or phrase.')
-                        binary_emo_question_with_transcription = question_prefix + transcription_prefix + transcription + '\' ' + binary_emotion_suffix
-                        binary_emo_question_without_transcription = question_prefix + binary_emotion_suffix
+                    counts[strongest_emotion] += 1
 
-                        annotations.append({
-                            'id': len(annotations),
-                            'image': f'images/{basename}.jpg',
-                            'audio': f'audio/{audio_name}',
-                            'conversations': [
-                                {'from': 'human', 'value': binary_emo_question_with_transcription},
-                                {'from': 'gpt', 'value': 'yes'}
-                            ]
-                        })
-
-                        annotations.append({
-                            'id': len(annotations),
-                            'image': f'images/{basename}.jpg',
-                            'audio': f'audio/{audio_name}',
-                            'conversations': [
-                                {'from': 'human', 'value': binary_emo_question_without_transcription},
-                                {'from': 'gpt', 'value': 'yes'}
-                            ]
-                        })
+                # for emotion, value in zip(emotions, label[1:]):
+                #     if value >= 1:
+                #         binary_emotion_suffix = ('Is the speaker feeling ' + emotion + ' in this video?\n'
+                #                                 'yes\nno\n'
+                #                                 'Answer with one word or phrase.')
+                #         binary_emo_question_with_transcription = question_prefix + transcription_prefix + transcription + '\' ' + binary_emotion_suffix
+                #         binary_emo_question_without_transcription = question_prefix + binary_emotion_suffix
+                #
+                #         annotations.append({
+                #             'id': len(annotations),
+                #             'image': f'images/{basename}.jpg',
+                #             'audio': f'audio/{audio_name}',
+                #             'conversations': [
+                #                 {'from': 'human', 'value': binary_emo_question_with_transcription},
+                #                 {'from': 'gpt', 'value': 'yes'}
+                #             ]
+                #         })
+                #
+                #         annotations.append({
+                #             'id': len(annotations),
+                #             'image': f'images/{basename}.jpg',
+                #             'audio': f'audio/{audio_name}',
+                #             'conversations': [
+                #                 {'from': 'human', 'value': binary_emo_question_without_transcription},
+                #                 {'from': 'gpt', 'value': 'yes'}
+                #             ]
+                #         })
 
     with open(os.path.join(mosei_path, 'annotation_train.jsonl'), 'w') as f:
         for annotation in annotations:
             f.write(json.dumps(annotation) + '\n')
+    print(counts)
 
 
 if __name__ == '__main__':

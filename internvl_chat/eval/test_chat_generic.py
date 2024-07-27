@@ -75,7 +75,8 @@ def main(meta_path, dataset_name, path):
         do_sample=False,
     )
     dataset.ds_name = dataset_name
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=concat_pad_data_collator)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
+                                             collate_fn=concat_pad_data_collator)
     length = len(dataset)
 
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
@@ -163,11 +164,12 @@ if __name__ == '__main__':
     # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"  # Vanilla model
     # path = "/home/dvd/data/phi3_backbone_all/checkpoint-1800/"  # Backbone trained on public
     # path = "/home/dvd/data/phi3_backbone_lora/"  # Backbone trained on public with lora
-    path = "/home/dvd/data/outputs/phq9_pretrain"  # Pretrained on PHQ9
+    # path = "/home/dvd/data/outputs/phq9_pretrain"  # Pretrained on PHQ9
     # path = "/home/data/outputs/phq9_lora"  # Pretrained on PHQ9 with lora
     # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora
     # path = '/home/dvd/data/outputs/behavioral_pretrain'  # Pretrained on behavioral
     # path = '/home/dvd/data/outputs/both_phq9'  # Pretrained on both PHQ9 and behavioral
-    main(meta_path='shell/data/behavioral_train.json',
+    path = '/home/dvd/data/outputs/phq9_pretrain_nonlora_3'
+    main(meta_path='shell/data/behavioral_val.json',
          dataset_name='behavioral_phq',
          path=path)
