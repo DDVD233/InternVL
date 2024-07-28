@@ -799,6 +799,7 @@ def main():
         logger.info('Building InternVLChatModel...')
         model = InternVLChatModel(internvl_chat_config, vision_model, llm)
     model.img_context_token_id = img_context_token_id
+    model.audio_context_token_id = audio_context_token_id
 
     assert model.config.downsample_ratio == data_args.down_sample_ratio
 
