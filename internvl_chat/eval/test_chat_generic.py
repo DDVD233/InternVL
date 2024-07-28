@@ -54,9 +54,11 @@ def main(meta_path, dataset_name, path):
         ds_collections = json.load(f)
 
     dataset = LazySupervisedDataset(
-            "phi3-chat", ds_collections[dataset_name],
-            tokenizer,
-            None,
+            "phi3-chat",
+            meta=ds_collections[dataset_name],
+            tokenizer=tokenizer,
+            tcs_loader=None,
+            ds_name=dataset_name,
             num_image_token=model.num_image_token,
             image_size=448,
             is_train=False,
@@ -68,6 +70,7 @@ def main(meta_path, dataset_name, path):
             max_dynamic_patch=4,
             repeat_time=1,
             normalize_type="imagenet",
+
         )
     generation_config = dict(
         num_beams=1,
@@ -162,6 +165,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"  # Vanilla model
+    path = "OpenGVLab/InternVL2-4B"  # Vanilla model
     # path = "/home/dvd/data/phi3_backbone_all/checkpoint-1800/"  # Backbone trained on public
     # path = "/home/dvd/data/phi3_backbone_lora/"  # Backbone trained on public with lora
     # path = "/home/dvd/data/outputs/phq9_pretrain"  # Pretrained on PHQ9
@@ -169,7 +173,7 @@ if __name__ == '__main__':
     # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora
     # path = '/home/dvd/data/outputs/behavioral_pretrain'  # Pretrained on behavioral
     # path = '/home/dvd/data/outputs/both_phq9'  # Pretrained on both PHQ9 and behavioral
-    path = '/home/dvd/data/outputs/phq9_pretrain_nonlora_3'
+    # path = '/home/dvd/data/outputs/phq9_pretrain_nonlora_3'
     main(meta_path='shell/data/behavioral_val.json',
          dataset_name='behavioral_phq',
          path=path)
