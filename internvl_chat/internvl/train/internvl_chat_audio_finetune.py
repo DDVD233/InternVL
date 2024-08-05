@@ -826,13 +826,14 @@ def main():
     model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
 
     if num_new_tokens > 0:
-        model.language_model.resize_token_embeddings(len(tokenizer))
+        embeds = model.language_model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
+        vocab_size = embeds.weight.size(0)
         output_embeddings = model.language_model.get_output_embeddings().weight.data
         output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
-        model.config.llm_config.vocab_size = len(tokenizer)
-        model.language_model.config.vocab_size = len(tokenizer)
+        model.config.llm_config.vocab_size = vocab_size
+        model.language_model.config.vocab_size = vocab_size
 
     model.language_model.config.use_cache = False
     model.vision_model.gradient_checkpointing = True

@@ -33,7 +33,8 @@ def main(transcription_on=False):
     # path = "OpenGVLab/InternVL-Chat-V1-5-Int8"
     # path = "OpenGVLab/InternVL-Chat-V1-5"
     # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"
-    path = "/home/data/phi3_iemocap"
+    # path = "/home/data/phi3_iemocap"
+    path = "/home/dvd/data/phi3_backbone_lora/"
 
     device_map = {
         'audio': 1,
@@ -48,7 +49,8 @@ def main(transcription_on=False):
         # low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
         # device_map=device_map
-    ).eval()
+    )
+    model = model.eval()
     model = model.to('cuda')
     # model.template = 'internvl_zh'
 

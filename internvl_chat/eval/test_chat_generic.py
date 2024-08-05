@@ -53,8 +53,10 @@ def main(meta_path, dataset_name, path):
     with open(meta_path, 'r') as f:
         ds_collections = json.load(f)
 
+    template_name = 'internlm2-chat' if ('8B' in path or '26B' in path) else 'phi3-chat'
+
     dataset = LazySupervisedDataset(
-            "phi3-chat",
+            template_name=template_name,
             meta=ds_collections[dataset_name],
             tokenizer=tokenizer,
             tcs_loader=None,
@@ -88,9 +90,14 @@ def main(meta_path, dataset_name, path):
     model.audio_context_token_id = audio_context_token_id
 
     # get categories
-    sample = (dataset[0]['question'].split('What is the emotion of the speaker in this video?\n')[1]
-              .split('\nAnswer with one word or phrase.')[0])
-    categories = sample.split('\n')
+    if 'What is the emotion of the speaker in this video?\n' in dataset[0]['question']:
+        sample = (dataset[0]['question'].split('What is the emotion of the speaker in this video?\n')[1]
+                  .split('\nAnswer with one word or phrase.')[0])
+        categories = sample.split('\n')
+    elif 'yes\nno\n' in dataset[0]['question']:
+        categories = ['yes', 'no']
+    else:
+        raise ValueError('Unexpected question format')
     counts = defaultdict(int)
     categories.append('unknown')
     metrics = {
@@ -108,6 +115,8 @@ def main(meta_path, dataset_name, path):
     for index, sample in enumerate(dataloader):
         if '<image>\n<audio>' not in sample['question'][0]:
             continue
+        if 'The speaker said' not in sample['question'][0]:
+            continue
         # move to cuda
         for key in sample.keys():
             if isinstance(sample[key], torch.Tensor):
@@ -122,13 +131,21 @@ def main(meta_path, dataset_name, path):
         else:
             audio_info = None
 
-        response = model.chat(tokenizer, sample['pixel_values'], sample['question'][0],
+        question = sample['question'][0]
+        # question = question.replace('Answer with one word or phrase.',
+        #                             'Provide an explanation first. Then answer with one word or phrase from the following: yes/no.')
+
+        response = model.chat(tokenizer, sample['pixel_values'], question,
                               generation_config=generation_config,
                               audio_info=audio_info)
-        try:
-            response_category = categories.index(response)
-        except ValueError:
-            response_category = categories.index('unknown')
+        response_category = categories.index('unknown')
+        for category in categories:
+            if response.endswith(category):
+                response_category = categories.index(category)
+        # try:
+        #     response_category = categories.index(response)
+        # except ValueError:
+        #     response_category = categories.index('unknown')
         target = sample['target'][0]
         target_category = categories.index(target)
         counts[target] += 1
@@ -165,15 +182,21 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"  # Vanilla model
-    path = "OpenGVLab/InternVL2-4B"  # Vanilla model
-    # path = "/home/dvd/data/phi3_backbone_all/checkpoint-1800/"  # Backbone trained on public
-    # path = "/home/dvd/data/phi3_backbone_lora/"  # Backbone trained on public with lora
-    # path = "/home/dvd/data/outputs/phq9_pretrain"  # Pretrained on PHQ9
+    # path = "OpenGVLab/InternVL2-4B"  # Vanilla model
+    path = "OpenGVLab/InternVL2-26B"  # Vanilla model
+    # path = "/home/data/outputs/all_public_backbone_2"  # Backbone trained on public
     # path = "/home/data/outputs/phq9_lora"  # Pretrained on PHQ9 with lora
-    # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora
+    # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora *
     # path = '/home/dvd/data/outputs/behavioral_pretrain'  # Pretrained on behavioral
     # path = '/home/dvd/data/outputs/both_phq9'  # Pretrained on both PHQ9 and behavioral
-    # path = '/home/dvd/data/outputs/phq9_pretrain_nonlora_3'
+    # path = '/home/dvd/data/outputs/phq9_full_pretrain_nonlora'
+    # path = '/home/dvd/data/outputs/phq9_full_pretrain_lora'
+    # path = '/home/dvd/data/outputs/phq9_on_vanilla_lora/'  # Pretrained on PHQ9 on vanilla model with lora
+    # path = '/home/dvd/data/outputs/phq9_binary_pretrain'
+    # path = '/home/dvd/data/outputs/phq9_binary_lora'
+    # path = '/home/dvd/data/outputs/phq9_binary_pretrain_on_vanilla_8B'
+    # path = '/home/data/outputs/all_public_backbone_3'
+    print(f'Path: {path}')
     main(meta_path='shell/data/behavioral_val.json',
-         dataset_name='behavioral_phq',
+         dataset_name='behavioral_phq_binary',
          path=path)

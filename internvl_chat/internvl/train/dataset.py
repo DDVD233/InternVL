@@ -651,6 +651,7 @@ def preprocess_internlm(
     if not text_only:
         new_conversations = []
         for conversation in conversations:
+            conversation = conversation.replace('<audio>', audio_tokens)
             for i in range(num_image):
                 image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token_list[i]}{IMG_END_TOKEN}'
                 conversation = conversation.replace('<image>', image_tokens, 1)
