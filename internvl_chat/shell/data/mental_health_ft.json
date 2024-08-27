@@ -26,5 +26,12 @@
     "data_augment": false,
     "repeat_time": 1,
     "length": 62908
+  },
+  "social_iq": {
+    "root": "/home/dvd/data/datasets/Social-IQ-2.0-Challenge/siq2/",
+    "annotation": "/home/dvd/data/datasets/Social-IQ-2.0-Challenge/siq2/annotations_train.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 5506
   }
 }

@@ -139,7 +139,7 @@ def main():
         ]
         cfg.data.test.pipeline[1].flip = True
     cfg.model.pretrained = None
-    cfg.data.test.test_mode = True
+    cfg.data.test.test_model = True
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':

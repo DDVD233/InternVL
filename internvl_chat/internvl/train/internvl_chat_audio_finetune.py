@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+import deepspeed
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -46,6 +47,7 @@ from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 from utils.audio_utils import process_audio
 import traceback
+import opensmile
 
 # Apply necessary patches for the transformers library
 replace_llama_rmsnorm_with_fused_rmsnorm()
@@ -55,6 +57,7 @@ replace_train_sampler()
 try:
     from petrel_client.client import Client
     from petrel_client.common.config import Config
+
     has_tcs_loader = True
 except ImportError as E:
     print('petrel_client is not installed. Using PIL to load images.')
@@ -152,6 +155,10 @@ class ModelArguments:
         default=False,
         metadata={'help': 'Set to True to use class weights for the loss function.'},
     )
+    audio_encoder_type: str = field(
+        default='opensmile',
+        metadata={'help': 'Specify the type of audio encoder to use. Could be `opensmile` or `whisper`.'}
+    )
 
 
 @dataclass
@@ -217,27 +224,28 @@ class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(
-        self,
-        template_name,
-        meta,
-        tokenizer,
-        tcs_loader,
-        ds_name,
-        num_image_token,
-        image_size=224,
-        is_train=True,
-        pad2square=False,
-        group_by_length=False,
-        dynamic_image_size=False,
-        use_thumbnail=False,
-        min_dynamic_patch=1,
-        max_dynamic_patch=6,
-        min_num_frame=4,  # for video data
-        max_num_frame=12,  # for video data
-        sampling_method='rand',  # for video data
-        repeat_time=1,
-        normalize_type='imagenet',
-        random_seed=0,
+            self,
+            template_name,
+            meta,
+            tokenizer,
+            tcs_loader,
+            ds_name,
+            num_image_token,
+            image_size=224,
+            is_train=True,
+            pad2square=False,
+            group_by_length=False,
+            dynamic_image_size=False,
+            use_thumbnail=False,
+            min_dynamic_patch=1,
+            max_dynamic_patch=6,
+            min_num_frame=4,  # for video data
+            max_num_frame=12,  # for video data
+            sampling_method='rand',  # for video data
+            repeat_time=1,
+            normalize_type='imagenet',
+            random_seed=0,
+            audio_encoder_type='opensmile',
     ):
         super(LazySupervisedDataset, self).__init__()
         self.ds_name = ds_name
@@ -255,6 +263,12 @@ class LazySupervisedDataset(Dataset):
         self.max_num_frame = max_num_frame
         self.min_num_frame = min_num_frame
         self.sampling_method = sampling_method
+        self.audio_encoder_type = audio_encoder_type
+        if self.audio_encoder_type == 'opensmile':
+            self.smile = opensmile.Smile(
+                feature_set=opensmile.FeatureSet.ComParE_2016,  # 65, 65, 6373
+                feature_level=opensmile.FeatureLevel.Functionals,
+            )
 
         logger.info('Formatting inputs...Skip in lazy mode')
         assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
@@ -277,7 +291,7 @@ class LazySupervisedDataset(Dataset):
 
         # Weight = inverse of frequency, lower frequency, higher weight
         max_size = max(self.statistics.values())
-        self.statistics = {k: (max_size / v) ** 2 for k, v in self.statistics.items()}
+        self.statistics = {k: max_size / v for k, v in self.statistics.items()}
         self.rng = np.random.default_rng(seed=random_seed)
         self.rng.shuffle(self.raw_data)
 
@@ -310,7 +324,7 @@ class LazySupervisedDataset(Dataset):
                             conversations, return_tensors='pt', padding=False, truncation=False,
                         ).input_ids.size(1)
                         self.conv2length[str_length] = token_length + num_image_token * (
-                                    max_dynamic_patch + use_thumbnail)
+                                max_dynamic_patch + use_thumbnail)
                     else:
                         token_length = self.conv2length[str_length]
                 self.length.append(token_length)
@@ -380,15 +394,21 @@ class LazySupervisedDataset(Dataset):
         if '<audio>' in data_item['conversations'][0]['value']:
             assert 'audio' in data_item, f'Audio is not found in the data item.'
             audio_path = data_item['audio']
-            audio_path = os.path.join(self.root, audio_path)
-            audio_info = process_audio(audio_path)
+            audio_path: str = os.path.join(self.root, audio_path)
 
-            audios = audio_info["input_audios"]
-            audio_span_tokens = audio_info["audio_span_tokens"]
-            input_audio_lengths = audio_info["input_audio_lengths"]
+            if self.audio_encoder_type == 'opensmile':
+                audios = self.smile.process_file(audio_path)
+                audios = torch.tensor(audios, dtype=torch.float32).mean(dim=1)  # 65, 6373
+                audio_span_tokens = [65]
+                input_audio_lengths = torch.LongTensor([65])
+            else:
+                audio_info = process_audio(audio_path)
+                audios = audio_info["input_audios"]
+                audio_span_tokens = audio_info["audio_span_tokens"]
+                input_audio_lengths = audio_info["input_audio_lengths"]
             audio_flags = torch.tensor([1] * audio_span_tokens[0], dtype=torch.long)
         else:
-            audios = torch.ones(1, 80, 300, dtype=torch.float32)
+            audios = torch.ones(1, 80, 3000, dtype=torch.float32)
             audio_span_tokens = [1]
             input_audio_lengths = torch.LongTensor([[2, 1]])
             audio_flags = torch.tensor([0] * audio_span_tokens[0], dtype=torch.long)
@@ -545,7 +565,7 @@ class LazySupervisedDataset(Dataset):
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
 
-        audios = torch.ones(1, 80, 300, dtype=torch.float32)
+        audios = torch.ones(1, 80, 3000, dtype=torch.float32)
         audio_span_tokens = [1]
         input_audio_lengths = torch.LongTensor([[2, 1]])
 
@@ -619,16 +639,17 @@ class LazySupervisedDataset(Dataset):
 
 
 def build_datasets(
-    data_args,
-    tokenizer,
-    tcs_loader,
-    model,
-    group_by_length=False,
-    dynamic_image_size=False,
-    use_thumbnail=False,
-    min_dynamic_patch=1,
-    max_dynamic_patch=12,
-    normalize_type='imagenet',
+        data_args,
+        tokenizer,
+        tcs_loader,
+        model,
+        group_by_length=False,
+        dynamic_image_size=False,
+        use_thumbnail=False,
+        min_dynamic_patch=1,
+        max_dynamic_patch=12,
+        normalize_type='imagenet',
+        audio_encoder_type='opensmile',
 ):
     datasets = []
     lengths = []
@@ -657,6 +678,7 @@ def build_datasets(
             repeat_time=repeat_time,
             normalize_type=normalize_type,
             random_seed=ds_idx,
+            audio_encoder_type=audio_encoder_type,
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
         datasets.append(dataset)
@@ -678,7 +700,8 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # If use DeepSpeed zero3, init_dist must before HfArgumentParser
     launcher = os.environ.get('LAUNCHER', 'slurm')
-    init_dist(launcher=launcher, backend='nccl')
+    if 'RANK' in os.environ:
+        init_dist(launcher=launcher, backend='nccl')
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
         # If we pass only one argument to the script, and it's the path to a json file,
@@ -767,8 +790,23 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         config.use_class_weights = model_args.use_class_weights
-        model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+        config.audio_encoder_type = model_args.audio_encoder_type
+
+        device_map = {
+            'audio': 1,
+            'vision_model': 1,
+            'mlp1': 1,
+            'mlp2': 1,
+            'language_model': 0,
+        }
+
+        if 'RANK' in os.environ:
+            model = InternVLChatModel.from_pretrained(
+                model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config,
+                low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
+        else:
+            model = InternVLChatModel.from_pretrained(
+                model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, device_map=device_map)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -847,7 +885,7 @@ def main():
         data_args, tokenizer, tcs_loader, model, group_by_length=training_args.group_by_length,
         dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
-        normalize_type=data_args.normalize_type)
+        normalize_type=data_args.normalize_type, audio_encoder_type=model_args.audio_encoder_type)
 
     def _freeze_params(module):
         for param in module.parameters():
@@ -884,7 +922,7 @@ def main():
             v.requires_grad = True
 
     # print trainable parameters
-    if dist.get_rank() == 0:
+    if 'RANK' not in os.environ or dist.get_rank() == 0:
         for name, param in model.named_parameters():
             if param.requires_grad:
                 logger.info(name)
@@ -896,14 +934,27 @@ def main():
     if model_args.use_custom_trainer:
         replace_create_optimizer()
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=None,
-        tokenizer=tokenizer,
-        data_collator=concat_pad_data_collator
-    )
+    if 'RANK' in os.environ:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=concat_pad_data_collator
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
+        # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, training_args.num_train_epochs)
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=concat_pad_data_collator,
+            optimizers=(optimizer, None)
+        )
 
     # Training
     if training_args.do_train:

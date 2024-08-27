@@ -24,7 +24,7 @@ AUDIO_END_TOKEN = '</audio>'
 AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
 
 
-def main(meta_path, dataset_name, path):
+def test_model(meta_path, dataset_name, path):
     print(f'Path: {path}')
 
     # load in bfloat16
@@ -166,14 +166,17 @@ def main(meta_path, dataset_name, path):
                     print(f'{metric_name}: {metric_computed}')
 
     # print final metrics
+    computed_metrics = {}
     for metric_name, metric in metrics.items():
         metric_computed = metric.compute()
         if metric_name == 'category_accuracy':
             for i, category in enumerate(categories):
                 print(f'{category}: {metric_computed[i]}')
+                computed_metrics[category] = metric_computed[i].item()
         else:
             print(f'{metric_name}: {metric_computed}')
-    print(counts)
+            computed_metrics[metric_name] = metric_computed.item()
+    return computed_metrics, counts
 
 
 if __name__ == '__main__':
@@ -183,7 +186,7 @@ if __name__ == '__main__':
 
     # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"  # Vanilla model
     # path = "OpenGVLab/InternVL2-4B"  # Vanilla model
-    path = "OpenGVLab/InternVL2-26B"  # Vanilla model
+    # path = "OpenGVLab/InternVL2-8B"  # Vanilla model
     # path = "/home/data/outputs/all_public_backbone_2"  # Backbone trained on public
     # path = "/home/data/outputs/phq9_lora"  # Pretrained on PHQ9 with lora
     # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora *
@@ -195,8 +198,8 @@ if __name__ == '__main__':
     # path = '/home/dvd/data/outputs/phq9_binary_pretrain'
     # path = '/home/dvd/data/outputs/phq9_binary_lora'
     # path = '/home/dvd/data/outputs/phq9_binary_pretrain_on_vanilla_8B'
-    # path = '/home/data/outputs/all_public_backbone_3'
+    path = '/home/dvd/data/outputs/phq9_on_vanilla_26B_lora_split3/'
     print(f'Path: {path}')
-    main(meta_path='shell/data/behavioral_val.json',
-         dataset_name='behavioral_phq_binary',
-         path=path)
+    test_model(meta_path='shell/data/behavioral_val_kfold.json',
+               dataset_name='behavioral_phq_split3',
+               path=path)

@@ -38,6 +38,7 @@ class InternVLChatConfig(PretrainedConfig):
             min_dynamic_patch=1,
             max_dynamic_patch=6,
             use_class_weights=False,
+            audio_encoder='opensmile',
             **kwargs):
         super().__init__(**kwargs)
 
@@ -74,6 +75,7 @@ class InternVLChatConfig(PretrainedConfig):
         self.min_dynamic_patch = min_dynamic_patch
         self.max_dynamic_patch = max_dynamic_patch
         self.use_class_weights = use_class_weights
+        self.audio_encoder = audio_encoder
 
         self.hidden_size = self.llm_config.hidden_size
         # By default, we use tie_word_embeddings=False for models of all sizes.
@@ -108,5 +110,6 @@ class InternVLChatConfig(PretrainedConfig):
         output['min_dynamic_patch'] = self.min_dynamic_patch
         output['max_dynamic_patch'] = self.max_dynamic_patch
         output['use_class_weights'] = self.use_class_weights
+        output['audio_encoder'] = self.audio_encoder
 
         return output
