@@ -266,8 +266,8 @@ class LazySupervisedDataset(Dataset):
         self.audio_encoder_type = audio_encoder_type
         if self.audio_encoder_type == 'opensmile':
             self.smile = opensmile.Smile(
-                feature_set=opensmile.FeatureSet.ComParE_2016,  # 65, 65, 6373
-                feature_level=opensmile.FeatureLevel.Functionals,
+                feature_set=opensmile.FeatureSet.ComParE_2016,  # 65, *
+                feature_level=opensmile.FeatureLevel.LowLevelDescriptors,
             )
 
         logger.info('Formatting inputs...Skip in lazy mode')
@@ -397,10 +397,20 @@ class LazySupervisedDataset(Dataset):
             audio_path: str = os.path.join(self.root, audio_path)
 
             if self.audio_encoder_type == 'opensmile':
-                audios = self.smile.process_file(audio_path)
-                audios = torch.tensor(audios, dtype=torch.float32).mean(dim=1)  # 65, 6373
-                audio_span_tokens = [65]
-                input_audio_lengths = torch.LongTensor([65])
+                audios = self.smile.process_file(audio_path).values
+                audios = torch.tensor(audios, dtype=torch.float32)  # *, 65
+                # Pad to multiples of 20
+                if audios.size(0) % 20 != 0:
+                    pad_size = 20 - audios.size(0) % 20
+                    audios = torch.cat([audios, torch.zeros(pad_size, 65, dtype=torch.float32)], dim=0)
+                # Reshape to *, 20*65
+                audios = audios.view(-1, 20 * 65)
+                length = audios.size(0)
+                if length > 128:  # Truncate to 128
+                    audios = audios[:128]
+                    length = 128
+                audio_span_tokens = [length]
+                input_audio_lengths = torch.LongTensor(audio_span_tokens)
             else:
                 audio_info = process_audio(audio_path)
                 audios = audio_info["input_audios"]
@@ -408,10 +418,16 @@ class LazySupervisedDataset(Dataset):
                 input_audio_lengths = audio_info["input_audio_lengths"]
             audio_flags = torch.tensor([1] * audio_span_tokens[0], dtype=torch.long)
         else:
-            audios = torch.ones(1, 80, 3000, dtype=torch.float32)
-            audio_span_tokens = [1]
-            input_audio_lengths = torch.LongTensor([[2, 1]])
-            audio_flags = torch.tensor([0] * audio_span_tokens[0], dtype=torch.long)
+            if self.audio_encoder_type == 'opensmile':
+                audios = torch.zeros(1, 20 * 65, dtype=torch.float32)
+                audio_span_tokens = [0]
+                input_audio_lengths = torch.LongTensor([0])
+                audio_flags = torch.tensor([0], dtype=torch.long)
+            else:
+                audios = torch.ones(1, 80, 3000, dtype=torch.float32)
+                audio_span_tokens = [1]
+                input_audio_lengths = torch.LongTensor([[2, 1]])
+                audio_flags = torch.tensor([0] * audio_span_tokens[0], dtype=torch.long)
 
         # Apply the transformation to each image and stack the results into a tensor
         pixel_values = [transform(image) for image in images]
@@ -565,9 +581,14 @@ class LazySupervisedDataset(Dataset):
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
 
-        audios = torch.ones(1, 80, 3000, dtype=torch.float32)
-        audio_span_tokens = [1]
-        input_audio_lengths = torch.LongTensor([[2, 1]])
+        if self.audio_encoder_type == 'opensmile':
+            audios = torch.zeros(1, 20 * 65, dtype=torch.float32)
+            audio_span_tokens = [1]
+            input_audio_lengths = torch.LongTensor([1])
+        else:
+            audios = torch.ones(1, 80, 3000, dtype=torch.float32)
+            audio_span_tokens = [1]
+            input_audio_lengths = torch.LongTensor([[2, 1]])
 
         num_patches = pixel_values.size(0)
 

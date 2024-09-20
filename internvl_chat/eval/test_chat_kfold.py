@@ -10,9 +10,10 @@ def test_chat_kfold():
     path_extensions = ['split1', 'split2', 'split3', 'split4', 'split5']
     # path_extensions = ['split1']
     # path_base = '/home/dvd/data/outputs/phq9_binary_on_vanilla_26B_lora'
-    path_base = '/home/dvd/data/outputs/phq9_26B_lora'
+    path_base = '/home/dvd/data/outputs/phq9_26B_opensmile'
     paths = [f'{path_base}_{ext}' for ext in path_extensions]
-    # paths = ['/home/dvd/data/outputs/all_public_backbones_26B/checkpoint-5000'] * 5
+    # paths = ['/home/dvd/data/outputs/all_public_backbones_26B_opensmile/checkpoint-2000'] * 5
+    # paths = ['OpenGVLab/InternVL2-26B'] * 5
     print(f'Paths: {paths}')
     dataset_base = 'behavioral_phq'
     datasets = [f'{dataset_base}_{ext}' for ext in path_extensions]
