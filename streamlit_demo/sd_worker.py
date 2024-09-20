@@ -52,7 +52,7 @@ if __name__ == '__main__':
 
     import uvicorn
     parser = argparse.ArgumentParser()
-    parser.add_argument('--port', default=11005, type=int)
+    parser.add_argument('--port', default=40006, type=int)
     args = parser.parse_args()
 
     uvicorn.run(app, host='0.0.0.0', port=args.port)

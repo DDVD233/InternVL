@@ -13,6 +13,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 # from streamlit_js_eval import streamlit_js_eval
 from functools import partial
 from io import BytesIO
@@ -28,14 +29,17 @@ from streamlit_image_select import image_select
 
 custom_args = sys.argv[1:]
 parser = argparse.ArgumentParser()
-parser.add_argument('--controller_url', type=str, default='http://10.140.60.209:10075', help='url of the controller')
-parser.add_argument('--sd_worker_url', type=str, default='http://0.0.0.0:40006', help='url of the stable diffusion worker')
+parser.add_argument('--controller_url', type=str, default='http://192.168.50.4:10075', help='url of the controller')
+parser.add_argument('--sd_worker_url', type=str, default='http://192.168.50.4:40006', help='url of the stable diffusion worker')
 parser.add_argument('--max_image_limit', type=int, default=4, help='maximum number of images')
 args = parser.parse_args(custom_args)
 controller_url = args.controller_url
 sd_worker_url = args.sd_worker_url
 max_image_limit = args.max_image_limit
 print('args:', args)
+
+hidden_prompt = ('You are an Image Chat Bot built by Multisensory Intelligence Group at MIT Media Lab, '
+                 'based on the InternVL2 structure by OpenGVLab. When asked about your name, you should say "Multisensory Chatbot".')
 
 
 def get_conv_log_filename():
@@ -55,25 +59,36 @@ def get_model_list():
 
 def load_upload_file_and_show():
     if uploaded_files is not None:
-        images, filenames = [], []
+        media, filenames = [], []
         for file in uploaded_files:
-            file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
-            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(img)
-            images.append(img)
-        with upload_image_preview.container():
-            Library(images)
+            file_extension = file.name.split('.')[-1].lower()
+            if file_extension in ['png', 'jpg', 'jpeg', 'webp']:
+                file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+                img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(img)
+                media.append(('image', img))
+            elif file_extension in ['mp4', 'avi', 'mov']:
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}')
+                temp_file.write(file.read())
+                temp_file.close()
+                media.append(('video', temp_file.name))
+            else:
+                st.warning(f"Unsupported file type: {file_extension}")
+                continue
 
-        image_hashes = [hashlib.md5(image.tobytes()).hexdigest() for image in images]
-        for image, hash in zip(images, image_hashes):
             t = datetime.datetime.now()
-            filename = os.path.join(LOGDIR, 'serve_images', f'{t.year}-{t.month:02d}-{t.day:02d}', f'{hash}.jpg')
+            filename = os.path.join(LOGDIR, 'serve_files', f'{t.year}-{t.month:02d}-{t.day:02d}', file.name)
             filenames.append(filename)
             if not os.path.isfile(filename):
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
-                image.save(filename)
-    return images, filenames
+                with open(filename, 'wb') as f:
+                    f.write(file.getvalue())
+
+        with upload_image_preview.container():
+            Library(media)
+
+    return media, filenames
 
 
 def get_selected_worker_ip():
@@ -107,10 +122,23 @@ def generate_response(messages):
     for message in messages:
         if message['role'] == 'user':
             user_message = {'role': 'user', 'content': message['content']}
-            if 'image' in message and len('image') > 0:
+            if 'media' in message and len(message['media']) > 0:
                 user_message['image'] = []
-                for image in message['image']:
-                    user_message['image'].append(pil_image_to_base64(image))
+                for item in message['media']:
+                    if item[0] == 'image':
+                        user_message['image'].append(pil_image_to_base64(item[1]))
+                    elif item[0] == 'video':
+                        video = cv2.VideoCapture(item[1])
+                        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+                        frames_to_sample = 4
+                        for i in range(frames_to_sample):
+                            video.set(cv2.CAP_PROP_POS_FRAMES, i * (total_frames // frames_to_sample))
+                            ret, frame = video.read()
+                            if ret:
+                                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                pil_image = Image.fromarray(frame)
+                                user_message['image'].append(pil_image_to_base64(pil_image))
+                        video.release()
             send_messages.append(user_message)
         else:
             send_messages.append({'role': 'assistant', 'content': message['content']})
@@ -171,23 +199,21 @@ def combined_func(func_list):
         func()
 
 
-def show_one_or_multiple_images(message, total_image_num, is_input=True):
-    if 'image' in message:
+def show_one_or_multiple_media(message, total_media_num, is_input=True):
+    if 'media' in message:
         if is_input:
-            total_image_num = total_image_num + len(message['image'])
+            total_media_num = total_media_num + len(message['media'])
             if lan == 'English':
-                if len(message['image']) == 1 and total_image_num == 1:
-                    label = f"(In this conversation, {len(message['image'])} image was uploaded, {total_image_num} image in total)"
-                elif len(message['image']) == 1 and total_image_num > 1:
-                    label = f"(In this conversation, {len(message['image'])} image was uploaded, {total_image_num} images in total)"
+                if len(message['media']) == 1 and total_media_num == 1:
+                    label = f"(In this conversation, {len(message['media'])} file was uploaded, {total_media_num} file in total)"
                 else:
-                    label = f"(In this conversation, {len(message['image'])} images were uploaded, {total_image_num} images in total)"
+                    label = f"(In this conversation, {len(message['media'])} files were uploaded, {total_media_num} files in total)"
             else:
-                label = f"(在本次对话中，上传了{len(message['image'])}张图片，总共上传了{total_image_num}张图片)"
-        upload_image_preview = st.empty()
-        with upload_image_preview.container():
-            Library(message['image'])
-        if is_input and len(message['image']) > 0:
+                label = f"(在本次对话中，上传了{len(message['media'])}个文件，总共上传了{total_media_num}个文件)"
+        upload_media_preview = st.empty()
+        with upload_media_preview.container():
+            Library(message['media'])
+        if is_input and len(message['media']) > 0:
             st.markdown(label)
 
 
@@ -199,8 +225,8 @@ def find_bounding_boxes(response):
         results.append((match[0], eval(match[1])))
     returned_image = None
     for message in st.session_state.messages:
-        if message['role'] == 'user' and 'image' in message and len(message['image']) > 0:
-            last_image = message['image'][-1]
+        if message['role'] == 'user' and 'media' in message and len(message['media']) > 0:
+            last_image = message['media'][-1]
             width, height = last_image.size
             returned_image = last_image.copy()
             draw = ImageDraw.Draw(returned_image)
@@ -253,31 +279,30 @@ logo_code = """
     </linearGradient>
   </defs>
   <text x="000" y="160" font-size="180" font-weight="bold" fill="url(#gradient1)" style="font-family: Arial, sans-serif;">
-    InternVL2 Demo
+    Image Chat
   </text>
 </svg>
 """
 
 # App title
-st.set_page_config(page_title='InternVL2')
+st.set_page_config(page_title='Multisensory Intelligence')
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
 
-system_message_default = '我是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。'
-
-system_message_editable = '请尽可能详细地回答用户的问题。'
+system_message_default = hidden_prompt
+system_message_editable = 'Please answer the questions with as much detail as possible. '
 
 # Replicate Credentials
 with st.sidebar:
     model_list = get_model_list()
     # "[![Open in GitHub](https://github.com/codespaces/badge.svg)](https://github.com/OpenGVLab/InternVL)"
-    lan = st.selectbox('#### Language / 语言', ['English', '中文'], on_change=st.rerun,
+    lan = st.selectbox('#### Language', ['English'], on_change=st.rerun,
                        help='This is only for switching the UI language. 这仅用于切换UI界面的语言。')
     if lan == 'English':
-        st.logo(logo_code, link='https://github.com/OpenGVLab/InternVL', icon_image=logo_code)
+        # st.logo(logo_code, link='https://github.com/OpenGVLab/InternVL', icon_image=logo_code)
         st.subheader('Models and parameters')
-        selected_model = st.sidebar.selectbox('Choose a InternVL2 chat model', model_list, key='selected_model',
+        selected_model = st.sidebar.selectbox('Choose a chat model', model_list, key='selected_model',
                                               on_change=clear_chat_history,
                                               help='Due to the limited GPU resources with public IP addresses, we can currently only deploy models up to a maximum of 26B.')
         with st.expander('🤖 System Prompt'):
@@ -293,19 +318,19 @@ with st.sidebar:
                                         value=12, step=1)
         upload_image_preview = st.empty()
         uploaded_files = st.file_uploader('Upload files', accept_multiple_files=True,
-                                          type=['png', 'jpg', 'jpeg', 'webp'],
+                                          type=['png', 'jpg', 'jpeg', 'webp', 'mp4', 'avi', 'mov'],
                                           help='You can upload multiple images (max to 4) or a single video.',
                                           key=f'uploader_{st.session_state.uploader_key}',
                                           on_change=st.rerun)
         uploaded_pil_images, save_filenames = load_upload_file_and_show()
-        todo_list = st.sidebar.selectbox('Our to-do list', ['👏This is our to-do list',
-                                                            '1. Support for video uploads',
-                                                            '2. Support for PDF uploads',
-                                                            '3. Write a usage document'], key='todo_list',
-                                         help='Here are some features we plan to support in the future.')
+        # todo_list = st.sidebar.selectbox('Our to-do list', ['👏This is our to-do list',
+        #                                                     '1. Support for video uploads',
+        #                                                     '2. Support for PDF uploads',
+        #                                                     '3. Write a usage document'], key='todo_list',
+        #                                  help='Here are some features we plan to support in the future.')
     else:
         st.subheader('模型和参数')
-        selected_model = st.sidebar.selectbox('选择一个 InternVL2 对话模型', model_list, key='selected_model',
+        selected_model = st.sidebar.selectbox('选择一个对话模型', model_list, key='selected_model',
                                               on_change=clear_chat_history,
                                               help='由于有限的公网GPU资源，我们暂时只能部署到最大参数26B的模型。')
         with st.expander('🤖 系统提示'):
@@ -320,7 +345,7 @@ with st.sidebar:
             max_input_tiles = st.slider('最大图像块数 (控制图像分辨率)', min_value=1, max_value=24, value=12, step=1)
         upload_image_preview = st.empty()
         uploaded_files = st.file_uploader('上传文件', accept_multiple_files=True,
-                                          type=['png', 'jpg', 'jpeg', 'webp'],
+                                          type=['png', 'jpg', 'jpeg', 'webp', 'mp4', 'avi', 'mov'],
                                           help='你可以上传多张图像（最多4张）或者一个视频。',
                                           key=f'uploader_{st.session_state.uploader_key}',
                                           on_change=st.rerun)
@@ -341,7 +366,7 @@ gradient_text_html = """
     font-size: 3em;
 }
 </style>
-<div class="gradient-text">InternVL2</div>
+<div class="gradient-text">Image Chat</div>
 """
 if lan == 'English':
     st.markdown(gradient_text_html, unsafe_allow_html=True)
@@ -358,16 +383,25 @@ gallery_placeholder = st.empty()
 with gallery_placeholder.container():
     examples = ['gallery/prod_9.jpg', 'gallery/astro_on_unicorn.png',
                 'gallery/prod_12.png', 'gallery/prod_en_17.png',
-                'gallery/prod_4.png', 'gallery/cheetah.png', 'gallery/prod_1.jpeg']
-    images = [Image.open(image) for image in examples]
+                'gallery/emotion_1.jpg', 'gallery/cheetah.png', 'gallery/mi_logo.jpg']
+
+    # images = [Image.open(image) for image in examples]
+    images = []
+    for filename in examples:
+        media_type = 'image' if filename[-4:].lower() in ['.png', '.jpg', '.webp'] else 'video'
+        if media_type == 'image':
+            img = Image.open(filename)
+            images.append(img)
+        else:
+            images.append(filename)
     if lan == 'English':
         captions = ["What's at the far end of the image?",
                     'Could you help me draw a picture like this one?',
                     'What are the consequences of the easy decisions shown in this image?',
                     "I'm on a diet, but I really want to eat them.",
-                    'Is this a real plant? Analyze the reasons.',
+                    'What is the emotion of each person in the scene?',
                     'Detect the <ref>the middle leopard</ref> in the image with its bounding box.',
-                    'Please identify and label all objects in the following image.']
+                    'What do you think of this logo?']
     else:
         captions = ['画面最远处是什么?',
                     '请画一张类似这样的画',
@@ -385,14 +419,14 @@ with gallery_placeholder.container():
         return_value='index',
         key='image_select'
     )
-    if lan == 'English':
-        st.caption(
-            'Note: For non-commercial research use only. AI responses may contain errors. Users should not spread or allow others to spread hate speech, violence, pornography, or fraud-related harmful information.')
-    else:
-        st.caption('注意：仅限非商业研究使用。用户应不传播或允许他人传播仇恨言论、暴力、色情内容或与欺诈相关的有害信息。')
+    # if lan == 'English':
+    #     st.caption(
+    #         'Note: For non-commercial research use only. AI responses may contain errors. Users should not spread or allow others to spread hate speech, violence, pornography, or fraud-related harmful information.')
+    # else:
+    #     st.caption('注意：仅限非商业研究使用。用户应不传播或允许他人传播仇恨言论、暴力、色情内容或与欺诈相关的有害信息。')
     if img_idx != -1 and len(st.session_state.messages) == 0 and selected_model is not None:
         gallery_placeholder.empty()
-        st.session_state.messages.append({'role': 'user', 'content': captions[img_idx], 'image': [images[img_idx]],
+        st.session_state.messages.append({'role': 'user', 'content': captions[img_idx], 'media': [images[img_idx]],
                                           'filenames': [examples[img_idx]]})
         st.rerun()  # Fixed an issue where examples were not emptied
 
@@ -400,15 +434,15 @@ if len(st.session_state.messages) > 0:
     gallery_placeholder.empty()
 
 # Display or clear chat messages
-total_image_num = 0
+total_media_num = 0
 for message in st.session_state.messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
-        show_one_or_multiple_images(message, total_image_num, is_input=message['role'] == 'user')
-        if 'image' in message and message['role'] == 'user':
-            total_image_num += len(message['image'])
+        show_one_or_multiple_media(message, total_media_num, is_input=message['role'] == 'user')
+        if 'media' in message and message['role'] == 'user':
+            total_media_num += len(message['media'])
 
-input_disable_flag = (len(model_list) == 0) or total_image_num + len(uploaded_files) > max_image_limit
+input_disable_flag = (len(model_list) == 0) or total_media_num + len(uploaded_files) > max_image_limit
 if lan == 'English':
     st.sidebar.button('Clear Chat History',
                       on_click=partial(combined_func, func_list=[clear_chat_history, clear_file_uploader]))
@@ -422,7 +456,7 @@ else:
     if input_disable_flag:
         prompt = st.chat_input('输入的图片太多了，请清空历史记录。', disabled=input_disable_flag)
     else:
-        prompt = st.chat_input('给 “InternVL” 发送消息', disabled=input_disable_flag)
+        prompt = st.chat_input('发送消息', disabled=input_disable_flag)
 
 alias_instructions = {
     '目标检测': '在以下图像中进行目标检测，并标出所有物体。',
@@ -434,13 +468,13 @@ alias_instructions = {
 if prompt:
     prompt = alias_instructions[prompt] if prompt in alias_instructions else prompt
     gallery_placeholder.empty()
-    image_list = uploaded_pil_images
+    media_list = uploaded_files
     st.session_state.messages.append(
-        {'role': 'user', 'content': prompt, 'image': image_list, 'filenames': save_filenames})
+        {'role': 'user', 'content': prompt, 'media': media_list, 'filenames': save_filenames})
     with st.chat_message('user'):
         st.write(prompt)
-        show_one_or_multiple_images(st.session_state.messages[-1], total_image_num, is_input=True)
-    if image_list:
+        show_one_or_multiple_media(st.session_state.messages[-1], total_media_num, is_input=True)
+    if media_list:
         clear_file_uploader()
 
 # Generate a new response if last message is not from assistant
@@ -454,12 +488,12 @@ if len(st.session_state.messages) > 0 and st.session_state.messages[-1]['role'] 
         with st.spinner('Drawing...'):
             if '<ref>' in response:
                 has_returned_image = find_bounding_boxes(response)
-                message['image'] = [has_returned_image] if has_returned_image else []
+                message['media'] = [has_returned_image] if has_returned_image else []
             if '```drawing-instruction' in response:
                 has_returned_image = query_image_generation(response, sd_worker_url=sd_worker_url)
-                message['image'] = [has_returned_image] if has_returned_image else []
+                message['media'] = [has_returned_image] if has_returned_image else []
             st.session_state.messages.append(message)
-            show_one_or_multiple_images(message, total_image_num, is_input=False)
+            show_one_or_multiple_media(message, total_media_num, is_input=False)
 
 if len(st.session_state.messages) > 0:
     col1, col2, col3, col4 = st.columns([1, 1, 1, 1.3])
