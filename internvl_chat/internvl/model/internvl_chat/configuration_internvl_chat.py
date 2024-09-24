@@ -38,7 +38,7 @@ class InternVLChatConfig(PretrainedConfig):
             min_dynamic_patch=1,
             max_dynamic_patch=6,
             use_class_weights=False,
-            audio_encoder='opensmile',
+            audio_encoder='whisper',
             **kwargs):
         super().__init__(**kwargs)
 

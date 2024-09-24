@@ -156,7 +156,7 @@ class ModelArguments:
         metadata={'help': 'Set to True to use class weights for the loss function.'},
     )
     audio_encoder_type: str = field(
-        default='opensmile',
+        default='whisper',
         metadata={'help': 'Specify the type of audio encoder to use. Could be `opensmile` or `whisper`.'}
     )
 
@@ -245,7 +245,7 @@ class LazySupervisedDataset(Dataset):
             repeat_time=1,
             normalize_type='imagenet',
             random_seed=0,
-            audio_encoder_type='opensmile',
+            audio_encoder_type='whisper',
     ):
         super(LazySupervisedDataset, self).__init__()
         self.ds_name = ds_name
@@ -389,6 +389,10 @@ class LazySupervisedDataset(Dataset):
             images = [Image.new('RGB', (224, 224), (255, 255, 255))]
             transform = build_transform(is_train=self.is_train, input_size=self.image_size,
                                         pad2square=self.pad2square, normalize_type=self.normalize_type)
+            if self.dynamic_image_size:
+                images = dynamic_preprocess(images[0], min_num=self.min_dynamic_patch, max_num=self.max_dynamic_patch,
+                                            image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+
             image_flags = 0
 
         if '<audio>' in data_item['conversations'][0]['value']:
@@ -425,7 +429,7 @@ class LazySupervisedDataset(Dataset):
                 audio_flags = torch.tensor([0], dtype=torch.long)
             else:
                 audios = torch.ones(1, 80, 3000, dtype=torch.float32)
-                audio_span_tokens = [1]
+                audio_span_tokens = [0]
                 input_audio_lengths = torch.LongTensor([[2, 1]])
                 audio_flags = torch.tensor([0] * audio_span_tokens[0], dtype=torch.long)
 
@@ -447,6 +451,7 @@ class LazySupervisedDataset(Dataset):
                                   self.tokenizer, [self.num_image_token * num_patches],
                                   num_audio_token=audio_span_tokens[0],
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
+        assert torch.sum(ret['input_ids'][0] == 92546).item() == pixel_values.size(0) * self.num_image_token
         target = data_item['conversations'][-1]['value']
         question = data_item['conversations'][0]['value']
         weight = self.statistics[target]
@@ -581,14 +586,44 @@ class LazySupervisedDataset(Dataset):
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
 
-        if self.audio_encoder_type == 'opensmile':
-            audios = torch.zeros(1, 20 * 65, dtype=torch.float32)
-            audio_span_tokens = [1]
-            input_audio_lengths = torch.LongTensor([1])
+        if '<audio>' in data_item['conversations'][0]['value']:
+            assert 'audio' in data_item, f'Audio is not found in the data item.'
+            audio_path = data_item['audio']
+            audio_path: str = os.path.join(self.root, audio_path)
+
+            if self.audio_encoder_type == 'opensmile':
+                audios = self.smile.process_file(audio_path).values
+                audios = torch.tensor(audios, dtype=torch.float32)  # *, 65
+                # Pad to multiples of 20
+                if audios.size(0) % 20 != 0:
+                    pad_size = 20 - audios.size(0) % 20
+                    audios = torch.cat([audios, torch.zeros(pad_size, 65, dtype=torch.float32)], dim=0)
+                # Reshape to *, 20*65
+                audios = audios.view(-1, 20 * 65)
+                length = audios.size(0)
+                if length > 128:  # Truncate to 128
+                    audios = audios[:128]
+                    length = 128
+                audio_span_tokens = [length]
+                input_audio_lengths = torch.LongTensor(audio_span_tokens)
+            else:
+                audio_info = process_audio(audio_path)
+                audios = audio_info["input_audios"]
+                audio_span_tokens = audio_info["audio_span_tokens"]
+                input_audio_lengths = audio_info["input_audio_lengths"]
+            audio_flags = torch.tensor([1] * audio_span_tokens[0], dtype=torch.long)
         else:
-            audios = torch.ones(1, 80, 3000, dtype=torch.float32)
-            audio_span_tokens = [1]
-            input_audio_lengths = torch.LongTensor([[2, 1]])
+            if self.audio_encoder_type == 'opensmile':
+                audios = torch.zeros(1, 20 * 65, dtype=torch.float32)
+                audio_span_tokens = [0]
+                input_audio_lengths = torch.LongTensor([0])
+                audio_flags = torch.tensor([0], dtype=torch.long)
+            else:
+                audios = torch.ones(1, 80, 3000, dtype=torch.float32)
+                # audios = None
+                audio_span_tokens = [0]
+                input_audio_lengths = torch.LongTensor([[2, 1]])
+                audio_flags = torch.tensor([0] * audio_span_tokens[0], dtype=torch.long)
 
         num_patches = pixel_values.size(0)
 
@@ -614,7 +649,7 @@ class LazySupervisedDataset(Dataset):
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
             image_flags=torch.tensor([0] * num_patches, dtype=torch.long),
-            audio_flags=torch.tensor([0] * audio_span_tokens[0], dtype=torch.long),
+            audio_flags=audio_flags,
             audios=audios,
             audio_span_tokens=audio_span_tokens,
             input_audio_lengths=input_audio_lengths,
@@ -627,8 +662,8 @@ class LazySupervisedDataset(Dataset):
         while True:
             try:
                 data_item = json.loads(self.raw_data[i])
-                if 'image' in data_item and len(data_item['image']) != 0:
-                    if type(data_item['image']) == list:
+                if ('image' in data_item and len(data_item['image']) != 0):
+                    if 'image' in data_item and type(data_item['image']) == list:
                         ret = self.multi_modal_multi_image_get_item(data_item)
                     else:
                         ret = self.multi_modal_get_item(data_item)
@@ -670,7 +705,7 @@ def build_datasets(
         min_dynamic_patch=1,
         max_dynamic_patch=12,
         normalize_type='imagenet',
-        audio_encoder_type='opensmile',
+        audio_encoder_type='whisper',
 ):
     datasets = []
     lengths = []
@@ -827,7 +862,7 @@ def main():
                 low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
         else:
             model = InternVLChatModel.from_pretrained(
-                model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, device_map=device_map)
+                model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, low_cpu_mem_usage=False)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)

@@ -434,7 +434,7 @@ class AudioEncoder(nn.Module):
         padding_mask = torch.ones([input_audios.size(0), max_len_in_batch]).to(dtype=self.conv1.weight.dtype,
                                                                                device=self.conv1.weight.device)
         for index in range(len(input_audios)):
-            padding_mask[index, :input_audio_lengths[index][0].item()] = 0
+            padding_mask[index, :input_audio_lengths[index, 0].item()] = 0
         x, bos, eos = self(input_audios, padding_mask,input_audio_lengths)
         output_audios = []
         for i in range(len(audio_span_tokens)):
