@@ -122,3 +122,10 @@ def pretty_print_semaphore(semaphore):
     if semaphore is None:
         return 'None'
     return f'Semaphore(value={semaphore._value}, locked={semaphore.locked()})'
+
+
+def is_from_pil(obj):
+    # Get the name of the module where the class of obj is defined
+    class_module = obj.__class__.__module__
+    # Check if the module name starts with 'PIL.'
+    return class_module.startswith('PIL.')

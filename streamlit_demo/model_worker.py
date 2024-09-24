@@ -31,6 +31,9 @@ from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, TextIteratorStreamer
 from utils import build_logger, pretty_print_semaphore, server_error_msg
 
+import whisper
+from moviepy.editor import VideoFileClip
+
 worker_id = str(uuid.uuid4())[:6]
 logger = build_logger('model_worker', f'model_worker_{worker_id}.log')
 global_counter = 0
@@ -199,6 +202,8 @@ class ModelWorker:
             target=heart_beat_worker, args=(self,))
         self.heart_beat_thread.start()
 
+        self.audio_model = whisper.load_model("base.en")
+
     def reload_model(self):
         del self.model
         torch.cuda.empty_cache()
@@ -291,6 +296,15 @@ class ModelWorker:
                         max_input_tile_temp.append(max(1, max_input_tiles // len(message['image'])))
                     if len(max_input_tile_temp) > 0:
                         max_input_tile_list.append(max_input_tile_temp)
+                if 'video' in message:
+                    # Extract .mp3 audio from video using moviepy
+                    video_filename = message['video']
+                    audio_filename = video_filename.replace('.mp4', '.mp3')
+                    video = VideoFileClip(video_filename)
+                    audio = video.audio
+                    audio.write_audiofile(audio_filename)
+                    transcript = self.audio_model.transcribe(audio_filename)['text']
+                    prefix += f'<transcript>{transcript}</transcript>\n'
                 content = prefix + message['content']
                 history.append([content, ])
             else:

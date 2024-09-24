@@ -25,7 +25,8 @@ import streamlit as st
 from constants import LOGDIR, server_error_msg
 from library import Library
 from PIL import Image, ImageDraw, ImageFont
-from streamlit_image_select import image_select
+from image_select import image_select
+from utils import is_from_pil
 
 custom_args = sys.argv[1:]
 parser = argparse.ArgumentParser()
@@ -38,8 +39,9 @@ sd_worker_url = args.sd_worker_url
 max_image_limit = args.max_image_limit
 print('args:', args)
 
-hidden_prompt = ('You are an Image Chat Bot built by Multisensory Intelligence Group at MIT Media Lab, '
-                 'based on the InternVL2 structure by OpenGVLab. When asked about your name, you should say "Multisensory Chatbot".')
+hidden_prompt = ('You are an Video Chat Bot built by Multisensory Intelligence Group at MIT Media Lab, '
+                 'based on the InternVL2 structure by OpenGVLab. When asked about your name, you should say "Multisensory Chatbot".'
+                 ' Treat multiple images as scenes in a video. Say "in the first scene" instead of "in the first image".')
 
 
 def get_conv_log_filename():
@@ -125,10 +127,11 @@ def generate_response(messages):
             if 'media' in message and len(message['media']) > 0:
                 user_message['image'] = []
                 for item in message['media']:
-                    if item[0] == 'image':
-                        user_message['image'].append(pil_image_to_base64(item[1]))
-                    elif item[0] == 'video':
-                        video = cv2.VideoCapture(item[1])
+                    item_ = item[1] if isinstance(item, tuple) else item
+                    if is_from_pil(item_):
+                        user_message['image'].append(pil_image_to_base64(item))
+                    elif isinstance(item_, str):  # This is a video
+                        video = cv2.VideoCapture(item)
                         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
                         frames_to_sample = 4
                         for i in range(frames_to_sample):
@@ -139,6 +142,8 @@ def generate_response(messages):
                                 pil_image = Image.fromarray(frame)
                                 user_message['image'].append(pil_image_to_base64(pil_image))
                         video.release()
+                        user_message['video'] = item_
+
             send_messages.append(user_message)
         else:
             send_messages.append({'role': 'assistant', 'content': message['content']})
@@ -279,7 +284,7 @@ logo_code = """
     </linearGradient>
   </defs>
   <text x="000" y="160" font-size="180" font-weight="bold" fill="url(#gradient1)" style="font-family: Arial, sans-serif;">
-    Image Chat
+    Video Chat Demo
   </text>
 </svg>
 """
@@ -366,7 +371,7 @@ gradient_text_html = """
     font-size: 3em;
 }
 </style>
-<div class="gradient-text">Image Chat</div>
+<div class="gradient-text">Video Chat Demo</div>
 """
 if lan == 'English':
     st.markdown(gradient_text_html, unsafe_allow_html=True)
@@ -381,9 +386,10 @@ if 'messages' not in st.session_state.keys():
 
 gallery_placeholder = st.empty()
 with gallery_placeholder.container():
-    examples = ['gallery/prod_9.jpg', 'gallery/astro_on_unicorn.png',
+    examples = ['gallery/prod_9.jpg',
                 'gallery/prod_12.png', 'gallery/prod_en_17.png',
-                'gallery/emotion_1.jpg', 'gallery/cheetah.png', 'gallery/mi_logo.jpg']
+                'gallery/emotion_1.jpg', 'gallery/cheetah.png', 'gallery/mi_logo.jpg',
+                'gallery/1_427.mp4']
 
     # images = [Image.open(image) for image in examples]
     images = []
@@ -396,12 +402,12 @@ with gallery_placeholder.container():
             images.append(filename)
     if lan == 'English':
         captions = ["What's at the far end of the image?",
-                    'Could you help me draw a picture like this one?',
                     'What are the consequences of the easy decisions shown in this image?',
                     "I'm on a diet, but I really want to eat them.",
                     'What is the emotion of each person in the scene?',
                     'Detect the <ref>the middle leopard</ref> in the image with its bounding box.',
-                    'What do you think of this logo?']
+                    'What do you think of this logo?',
+                    'What is the emotion of each person in the scene in each frame?']
     else:
         captions = ['画面最远处是什么?',
                     '请画一张类似这样的画',

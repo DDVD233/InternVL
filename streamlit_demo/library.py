@@ -36,7 +36,7 @@ class Library():
         default_library = Library(images=pil_images)
     """
 
-    def __init__(self, media, media_alignment='end', number_of_columns=5):
+    def __init__(self, media, media_alignment='end', number_of_columns=1):
         self.media = media
         self.media_alignment = media_alignment
         self.number_of_columns = number_of_columns
@@ -67,7 +67,7 @@ class Library():
                             if item[0] == 'image':
                                 st.image(item[1], use_column_width='auto')
                             elif item[0] == 'video':
-                                st.video(item[1])
+                                st.video(item[1], autoplay=True, loop=True, muted=True)
                         elif isinstance(item, str):
                             st.video(item)
                         st.write(
