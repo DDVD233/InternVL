@@ -91,21 +91,6 @@ def format_questions(path):
             f.write(json.dumps(d) + '\n')
 
 
-def mosei_recover():
-    raw_path = "mosei.hdf5"
-    filepath = "mosei_raw.pkl"
-
-    with open(filepath, "rb") as f:
-        alldata = pickle.load(f)
-
-    image_numpy = alldata['train']['vision'][0][0]
-
-    image_numpy = image_numpy[:676].reshape(26, 26).astype(np.uint8)
-
-    image = Image.fromarray(image_numpy)
-    image.save('image.png')
-
-
 if __name__ == '__main__':
     data_path = '/home/dvd/data/datasets/cmu_mosei/'
     diversify_data(os.path.join(data_path, 'annotation_train.jsonl'),

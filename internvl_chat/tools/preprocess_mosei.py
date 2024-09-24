@@ -111,6 +111,8 @@ def preprocess_mosei():
     emotions = ['happy', 'sad', 'anger', 'surprise', 'disgust', 'fear']
 
     annotations = []
+    annotations_valid = []
+    annotations_test = []
     counts = defaultdict(int)
 
     with h5py.File(label_path, 'r') as f:
@@ -153,6 +155,8 @@ def preprocess_mosei():
 
                 csv_entry = csv_label[(csv_label['video_id'] == video_name) & (csv_label['clip_id'] == clip_id)]
                 transcription = csv_entry['text'].values[0]
+                mode = csv_entry['mode'].values[0]
+
 
                 sentiment_suffix = ('What is the sentiment of the speaker in this video?\n'
                                     'negative\nweakly negative\nneutral\nweakly positive\npositive\n'
@@ -160,7 +164,7 @@ def preprocess_mosei():
                 question_with_transcription = question_prefix + transcription_prefix + transcription + '\' ' + sentiment_suffix
                 question_without_transcription = question_prefix + sentiment_suffix
 
-                annotations.append({
+                annotation_with_transcription = {
                     'id': len(annotations),
                     'image': f'images/{basename}.jpg',
                     'audio': f'audio/{audio_name}',
@@ -168,17 +172,25 @@ def preprocess_mosei():
                         {'from': 'human', 'value': question_with_transcription},
                         {'from': 'gpt', 'value': sentiment_str}
                     ]
-                })
+                }
+                if mode == 'train':
+                    annotations.append(annotation_with_transcription)
 
-                annotations.append({
-                    'id': len(annotations),
-                    'image': f'images/{basename}.jpg',
-                    'audio': f'audio/{audio_name}',
-                    'conversations': [
-                        {'from': 'human', 'value': question_without_transcription},
-                        {'from': 'gpt', 'value': sentiment_str}
-                    ]
-                })
+                    annotations.append({
+                        'id': len(annotations),
+                        'image': f'images/{basename}.jpg',
+                        'audio': f'audio/{audio_name}',
+                        'conversations': [
+                            {'from': 'human', 'value': question_without_transcription},
+                            {'from': 'gpt', 'value': sentiment_str}
+                        ]
+                    })
+                elif mode == 'valid':
+                    annotations_valid.append(annotation_with_transcription)
+                elif mode == 'test':
+                    annotations_test.append(annotation_with_transcription)
+                else:
+                    logging.warning(f"Unknown mode {mode} for {clip_path}.")
                 counts[sentiment_str] += 1
 
                 strongest_emotion_index = np.argmax(label[1:])
@@ -191,7 +203,7 @@ def preprocess_mosei():
                     emo_question_with_transcription = question_prefix + transcription_prefix + transcription + '\' ' + emotion_suffix
                     emo_question_without_transcription = question_prefix + emotion_suffix
 
-                    annotations.append({
+                    annotation_with_transcription = {
                         'id': len(annotations),
                         'image': f'images/{basename}.jpg',
                         'audio': f'audio/{audio_name}',
@@ -199,17 +211,26 @@ def preprocess_mosei():
                             {'from': 'human', 'value': emo_question_with_transcription},
                             {'from': 'gpt', 'value': strongest_emotion}
                         ]
-                    })
+                    }
 
-                    annotations.append({
-                        'id': len(annotations),
-                        'image': f'images/{basename}.jpg',
-                        'audio': f'audio/{audio_name}',
-                        'conversations': [
-                            {'from': 'human', 'value': emo_question_without_transcription},
-                            {'from': 'gpt', 'value': strongest_emotion}
-                        ]
-                    })
+                    if mode == 'train':
+                        annotations.append(annotation_with_transcription)
+
+                        annotations.append({
+                            'id': len(annotations),
+                            'image': f'images/{basename}.jpg',
+                            'audio': f'audio/{audio_name}',
+                            'conversations': [
+                                {'from': 'human', 'value': emo_question_without_transcription},
+                                {'from': 'gpt', 'value': strongest_emotion}
+                            ]
+                        })
+                    elif mode == 'valid':
+                        annotations_valid.append(annotation_with_transcription)
+                    elif mode == 'test':
+                        annotations_test.append(annotation_with_transcription)
+                    else:
+                        logging.warning(f"Unknown mode {mode} for {clip_path}.")
 
                     counts[strongest_emotion] += 1
 
@@ -243,6 +264,12 @@ def preprocess_mosei():
 
     with open(os.path.join(mosei_path, 'annotation_train.jsonl'), 'w') as f:
         for annotation in annotations:
+            f.write(json.dumps(annotation) + '\n')
+    with open(os.path.join(mosei_path, 'annotation_valid.jsonl'), 'w') as f:
+        for annotation in annotations_valid:
+            f.write(json.dumps(annotation) + '\n')
+    with open(os.path.join(mosei_path, 'annotation_test.jsonl'), 'w') as f:
+        for annotation in annotations_test:
             f.write(json.dumps(annotation) + '\n')
     print(counts)
 
