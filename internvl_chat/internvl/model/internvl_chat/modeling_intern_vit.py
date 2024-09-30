@@ -161,8 +161,8 @@ class InternVisionEmbeddings(nn.Module):
 
     def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
         target_dtype = self.patch_embedding.weight.dtype
-        pixel_values = pixel_values.to(self.patch_embedding.weight.device)
-        patch_embeds = self.patch_embedding(pixel_values.to(target_dtype))  # shape = [*, channel, width, height]
+        pixel_values = pixel_values.to(target_dtype)
+        patch_embeds = self.patch_embedding(pixel_values)  # shape = [*, channel, width, height]
         batch_size, _, height, width = patch_embeds.shape
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
         class_embeds = self.class_embedding.expand(batch_size, 1, -1).to(target_dtype)

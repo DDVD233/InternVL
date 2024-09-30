@@ -6,7 +6,7 @@ from typing import List, Literal
 import torch
 from transformers import AutoTokenizer
 from models.InternVL.internvl_chat.internvl.model.internvl_chat import InternVLChatModel
-from torchmetrics import Accuracy, F1Score
+from torchmetrics import Accuracy, F1Score, Specificity, Recall
 from models.InternVL.internvl_chat.internvl.train.internvl_chat_finetune import LazySupervisedDataset, \
     concat_pad_data_collator
 from models.InternVL.internvl_chat.internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
@@ -100,29 +100,13 @@ def test_model(meta_path, dataset_name, path, modality='all'):
     print(f'Categories: {categories}')
     counts = defaultdict(int)
     metrics = {
-        'category_accuracy': Accuracy(task='multilabel', num_labels=len(categories), average='none'),
-        'overall_accuracy': Accuracy(task='multilabel', num_labels=len(categories), average='micro'),
-        'f1': F1Score(task='multiclass', num_classes=len(categories), average='macro')
+        'category_specificity': Specificity(task='multilabel', num_labels=len(categories), average='none'),
+        'overall_specificity': Specificity(task='multilabel', num_labels=len(categories), average='micro'),
+        'category_sensitivity': Recall(task='multilabel', num_labels=len(categories), average='none'),
+        'overall_sensitivity': Recall(task='multilabel', num_labels=len(categories), average='micro'),
     }
 
     for index, sample in enumerate(dataloader):
-        included_modality = []
-        if 'mosei' in dataset_name and modality != 'all':
-            if modality == 'image':
-                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + \
-                                        sample['question'][0].split('\'')[-1]
-            if modality == 'text':
-                sample['question'][0] = sample['question'][0].replace('<image>\n', '')
-        if sample['image_flags'][0].item() == 1:
-            included_modality.append('image')
-        if 'The speaker said' in sample['question'][0]:
-            included_modality.append('text')
-        if modality == 'all' and len(included_modality) != 3:
-            continue
-        if modality == 'image' and ('image' not in included_modality or len(included_modality) > 1):
-            continue
-        if modality == 'text' and ('text' not in included_modality or len(included_modality) > 1):
-            continue
         # move to cuda
         for key in sample.keys():
             if isinstance(sample[key], torch.Tensor):
@@ -160,15 +144,16 @@ def test_model(meta_path, dataset_name, path, modality='all'):
         counts[target] += 1
         print(f'Predicted: {response}, Target: {target}. The answer is correct: {response == target}')
         for metric in metrics.values():
-            metric(response, target)
+            metric(pred_tensor.unsqueeze(0), target_tensor.unsqueeze(0))
         if index % 10 == 0:
             print(f'Processed {index}/{length} samples')
             # print metrics
             for metric_name, metric in metrics.items():
                 metric_computed = metric.compute()
-                if metric_name == 'category_accuracy':
+                if 'category' in metric_name:
+                    submetric_name = metric_name.split('_')[1]
                     for i, category in enumerate(categories):
-                        print(f'{category}: {metric_computed[i]}')
+                        print(f'{category} {submetric_name}: {metric_computed[i]}')
                 else:
                     print(f'{metric_name}: {metric_computed}')
 
@@ -176,10 +161,11 @@ def test_model(meta_path, dataset_name, path, modality='all'):
     computed_metrics = {}
     for metric_name, metric in metrics.items():
         metric_computed = metric.compute()
-        if metric_name == 'category_accuracy':
+        if 'category' in metric_name:
+            submetric_name = metric_name.split('_')[1]
             for i, category in enumerate(categories):
-                print(f'{category}: {metric_computed[i]}')
-                computed_metrics[category] = metric_computed[i].item()
+                print(f'{submetric_name}/{category}: {metric_computed[i]}')
+                computed_metrics[f'{submetric_name}/{category}'] = metric_computed[i].item()
         else:
             print(f'{metric_name}: {metric_computed}')
             computed_metrics[metric_name] = metric_computed.item()
