@@ -1,7 +1,7 @@
 import ujson as json
 import os
 from collections import defaultdict
-from typing import List
+from typing import List, Literal
 
 import torch
 from transformers import AutoTokenizer
@@ -28,7 +28,6 @@ def test_model(meta_path, dataset_name, path, modality='all'):
 
     if '26B' in path:
         device_map = {
-            'audio': 1,
             'vision_model': 1,
             'mlp1': 1,
             'mlp2': 1,
@@ -86,30 +85,23 @@ def test_model(meta_path, dataset_name, path, modality='all'):
     length = len(dataset)
 
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-    audio_context_token_id = tokenizer.convert_tokens_to_ids(AUDIO_CONTEXT_TOKEN)
     model.img_context_token_id = img_context_token_id
-    model.audio_context_token_id = audio_context_token_id
-
-    # get categories
-    # if 'What is the emotion of the speaker in this video?\n' in dataset[0]['question']:
-    #     sample = (dataset[0]['question'].split('What is the emotion of the speaker in this video?\n')[1]
-    #               .split('\nAnswer with one word or phrase.')[0])
-    #     categories = sample.split('\n')
-    # elif 'yes\nno\n' in dataset[0]['question']:
-    #     categories = ['yes', 'no']
-    # else:
-    #     # Go through answers and get categories
     categories = []
+    # task: Literal["binary", "multiclass", "multilabel"] = 'multiclass'
     for index, sample in enumerate(dataset.raw_data):
         answer = json.loads(sample)['conversations'][1]['value']
-        if answer not in categories:
-            categories.append(answer)
+        if ',' in answer:  # this is multilabel
+            answers = answer.split(',')
+            answers = [a.strip().lower() for a in answers]
+            categories.extend(answers)
+        else:
+            categories.append(answer.lower())
+    categories = list(set(categories))
     print(f'Categories: {categories}')
     counts = defaultdict(int)
-    categories.append('unknown')
     metrics = {
-        'category_accuracy': Accuracy(task='multiclass', num_classes=len(categories), average='none'),
-        'overall_accuracy': Accuracy(task='multiclass', num_classes=len(categories), average='micro'),
+        'category_accuracy': Accuracy(task='multilabel', num_labels=len(categories), average='none'),
+        'overall_accuracy': Accuracy(task='multilabel', num_labels=len(categories), average='micro'),
         'f1': F1Score(task='multiclass', num_classes=len(categories), average='macro')
     }
 
@@ -117,28 +109,17 @@ def test_model(meta_path, dataset_name, path, modality='all'):
         included_modality = []
         if 'mosei' in dataset_name and modality != 'all':
             if modality == 'image':
-                sample['question'][0] = sample['question'][0].replace('<audio>\n', '')
                 sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + \
                                         sample['question'][0].split('\'')[-1]
-                sample['audio_flags'] = torch.zeros_like(sample['audio_flags'])
-            if modality == 'audio':
-                sample['question'][0] = sample['question'][0].replace('<image>\n', '')
-                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + \
-                                        sample['question'][0].split('\'')[-1]
-                sample['image_flags'] = torch.zeros_like(sample['image_flags'])
             if modality == 'text':
-                sample['question'][0] = sample['question'][0].replace('<audio>\n', '').replace('<image>\n', '')
+                sample['question'][0] = sample['question'][0].replace('<image>\n', '')
         if sample['image_flags'][0].item() == 1:
             included_modality.append('image')
-        if sample['audio_flags'].size(0) > 1 and sample['audio_flags'][0].item() == 1:
-            included_modality.append('audio')
         if 'The speaker said' in sample['question'][0]:
             included_modality.append('text')
         if modality == 'all' and len(included_modality) != 3:
             continue
         if modality == 'image' and ('image' not in included_modality or len(included_modality) > 1):
-            continue
-        if modality == 'audio' and ('audio' not in included_modality or len(included_modality) > 1):
             continue
         if modality == 'text' and ('text' not in included_modality or len(included_modality) > 1):
             continue
@@ -151,20 +132,33 @@ def test_model(meta_path, dataset_name, path, modality='all'):
 
         response = model.chat(tokenizer, sample['pixel_values'], question,
                               generation_config=generation_config)
-        response_category = categories.index('unknown')
-        for category in categories:
-            if response.endswith(category):
-                response_category = categories.index(category)
-        # try:
-        #     response_category = categories.index(response)
-        # except ValueError:
-        #     response_category = categories.index('unknown')
+        pred_tensor = torch.zeros(len(categories))
+        if ',' in response:
+            answers = response.split(',')
+            answers = [a.strip().lower() for a in answers]
+            for answer in answers:
+                for category in categories:
+                    if answer.endswith(category):
+                        pred_tensor[categories.index(category)] = 1
+        else:
+            for category in categories:
+                if response.lower().endswith(category):
+                    pred_tensor[categories.index(category)] = 1
         target = sample['target'][0]
-        target_category = categories.index(target)
+        if ',' in target:
+            targets = target.split(',')
+            targets = [a.strip().lower() for a in targets]
+            target_tensor = torch.zeros(len(categories))
+            for target in targets:
+                for category in categories:
+                    if target.endswith(category):
+                        target_tensor[categories.index(category)] = 1
+        else:
+            target_category = categories.index(target.lower())
+            target_tensor = torch.zeros(len(categories))
+            target_tensor[target_category] = 1
         counts[target] += 1
         print(f'Predicted: {response}, Target: {target}. The answer is correct: {response == target}')
-        response = torch.tensor([response_category])
-        target = torch.tensor([target_category])
         for metric in metrics.values():
             metric(response, target)
         if index % 10 == 0:
