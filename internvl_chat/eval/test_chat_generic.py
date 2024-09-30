@@ -5,25 +5,20 @@ from typing import List
 
 import torch
 from transformers import AutoTokenizer
-from internvl.model.internvl_chat import InternVLChatModel
+from models.InternVL.internvl_chat.internvl.model.internvl_chat import InternVLChatModel
 from torchmetrics import Accuracy, F1Score
-from internvl.train.internvl_chat_audio_finetune import LazySupervisedDataset, concat_pad_data_collator
-from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
-                                      IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
-                                      IMG_START_TOKEN, QUAD_END_TOKEN,
-                                      QUAD_START_TOKEN, REF_END_TOKEN,
-                                      REF_START_TOKEN)
-from internvl.model.internvl_chat import InternVLChatModel
+from models.InternVL.internvl_chat.internvl.train.internvl_chat_finetune import LazySupervisedDataset, \
+    concat_pad_data_collator
+from models.InternVL.internvl_chat.internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
+                                                                    IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
+                                                                    IMG_START_TOKEN, QUAD_END_TOKEN,
+                                                                    QUAD_START_TOKEN, REF_END_TOKEN,
+                                                                    REF_START_TOKEN)
 from transformers.modeling_outputs import CausalLMOutputWithPast
 # prog bar
 from tqdm import tqdm
 
 import argparse
-
-
-AUDIO_START_TOKEN = '<audio>'
-AUDIO_END_TOKEN = '</audio>'
-AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
 
 
 def test_model(meta_path, dataset_name, path, modality='all'):
@@ -53,11 +48,6 @@ def test_model(meta_path, dataset_name, path, modality='all'):
         ).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-    if 'OpenGVLab' in path:  # vanilla model
-        tokenizer.add_tokens([AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN], special_tokens=True)
-        model.language_model.resize_token_embeddings(len(tokenizer))
-        model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
-        model.init_mlp2()
 
     if '26B' not in path:
         model = model.to('cuda')
@@ -68,24 +58,23 @@ def test_model(meta_path, dataset_name, path, modality='all'):
     template_name = 'internlm2-chat' if ('8B' in path or '26B' in path) else 'phi3-chat'
 
     dataset = LazySupervisedDataset(
-            template_name=template_name,
-            meta=ds_collections[dataset_name],
-            tokenizer=tokenizer,
-            tcs_loader=None,
-            ds_name=dataset_name,
-            num_image_token=model.num_image_token,
-            image_size=448,
-            is_train=False,
-            pad2square=False,
-            group_by_length=True,
-            dynamic_image_size=True,
-            use_thumbnail=True,
-            min_dynamic_patch=1,
-            max_dynamic_patch=4,
-            repeat_time=1,
-            normalize_type="imagenet",
-            audio_encoder_type="whisper",
-        )
+        template_name=template_name,
+        meta=ds_collections[dataset_name],
+        tokenizer=tokenizer,
+        tcs_loader=None,
+        ds_name=dataset_name,
+        num_image_token=model.num_image_token,
+        image_size=448,
+        is_train=False,
+        pad2square=False,
+        group_by_length=True,
+        dynamic_image_size=True,
+        use_thumbnail=True,
+        min_dynamic_patch=1,
+        max_dynamic_patch=4,
+        repeat_time=1,
+        normalize_type="imagenet",
+    )
     generation_config = dict(
         num_beams=1,
         max_new_tokens=50,
@@ -124,22 +113,18 @@ def test_model(meta_path, dataset_name, path, modality='all'):
         'f1': F1Score(task='multiclass', num_classes=len(categories), average='macro')
     }
 
-
-    # Iterate over data
-    output_path = '/home/dvd/data/depression_interview/behavioral_output'
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-
     for index, sample in enumerate(dataloader):
         included_modality = []
         if 'mosei' in dataset_name and modality != 'all':
             if modality == 'image':
                 sample['question'][0] = sample['question'][0].replace('<audio>\n', '')
-                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + sample['question'][0].split('\'')[-1]
+                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + \
+                                        sample['question'][0].split('\'')[-1]
                 sample['audio_flags'] = torch.zeros_like(sample['audio_flags'])
             if modality == 'audio':
                 sample['question'][0] = sample['question'][0].replace('<image>\n', '')
-                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + sample['question'][0].split('\'')[-1]
+                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + \
+                                        sample['question'][0].split('\'')[-1]
                 sample['image_flags'] = torch.zeros_like(sample['image_flags'])
             if modality == 'text':
                 sample['question'][0] = sample['question'][0].replace('<audio>\n', '').replace('<image>\n', '')
@@ -162,22 +147,10 @@ def test_model(meta_path, dataset_name, path, modality='all'):
             if isinstance(sample[key], torch.Tensor):
                 sample[key] = sample[key].to('cuda')
 
-        if 'audio' in sample:
-            audio_info = {
-                "input_audios": sample['audios'],
-                "audio_span_tokens": sample['audio_span_tokens'],
-                "input_audio_lengths": sample['input_audio_lengths'],
-            }
-        else:
-            audio_info = None
-
         question = sample['question'][0]
-        # question = question.replace('Answer with one word or phrase.',
-        #                             'Provide an explanation first. Then answer with one word or phrase from the following: yes/no.')
 
         response = model.chat(tokenizer, sample['pixel_values'], question,
-                              generation_config=generation_config,
-                              audio_info=audio_info)
+                              generation_config=generation_config)
         response_category = categories.index('unknown')
         for category in categories:
             if response.endswith(category):
@@ -221,26 +194,22 @@ def test_model(meta_path, dataset_name, path, modality='all'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--transcription', action='store_true')
     args = parser.parse_args()
-
-    # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"  # Vanilla model
-    # path = "OpenGVLab/InternVL2-4B"  # Vanilla model
-    # path = "OpenGVLab/InternVL2-26B"  # Vanilla model
-    # path = "/home/data/outputs/all_public_backbone_2"  # Backbone trained on public
-    # path = "/home/data/outputs/phq9_lora"  # Pretrained on PHQ9 with lora
-    # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora *
-    # path = '/home/dvd/data/outputs/behavioral_pretrain'  # Pretrained on behavioral
-    # path = '/home/dvd/data/outputs/both_phq9'  # Pretrained on both PHQ9 and behavioral
-    # path = '/home/dvd/data/outputs/phq9_full_pretrain_nonlora'
-    # path = '/home/dvd/data/outputs/phq9_full_pretrain_lora'
-    # path = '/home/dvd/data/outputs/phq9_on_vanilla_lora/'  # Pretrained on PHQ9 on vanilla model with lora
-    # path = '/home/dvd/data/outputs/phq9_binary_pretrain'
-    # path = '/home/dvd/data/outputs/phq9_binary_lora'
-    # path = '/home/dvd/data/outputs/phq9_binary_pretrain_on_vanilla_8B'
-    path = '/home/dvd/data/outputs/all_public_backbones_8B_opensmile_nodrop'
+    path = 'OpenGVLab/InternVL2-8B'
     print(f'Path: {path}')
-    test_model(meta_path='shell/data/mental_health_test.json',
-               dataset_name='mosei_test',
-               path=path,
-               modality='audio')
+    meta_path = 'processing/meta_valid.json'
+    with open(meta_path, 'r') as f:
+        ds_collections = json.load(f)
+    datasets = list(ds_collections.keys())
+    dataset_metrics = {}
+    for dataset in datasets:
+        print(f'Dataset: {dataset}')
+        metrics, counts = test_model(meta_path=meta_path,
+                                     dataset_name=dataset,
+                                     path=path,
+                                     modality='all')
+        dataset_metrics[dataset] = metrics
+        for key, value in counts.items():
+            dataset_metrics[dataset][f"{key}_count"] = value
+
+        print(dataset_metrics)
