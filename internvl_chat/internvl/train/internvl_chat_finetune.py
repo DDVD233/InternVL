@@ -367,13 +367,18 @@ class LazySupervisedDataset(Dataset):
                                   self.tokenizer, [self.num_image_token * num_patches],
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
 
+        question = data_item['conversations'][0]['value']
+        target = data_item['conversations'][1]['value']
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            question=question,
+            target=target
         )
         return ret
 
@@ -410,13 +415,18 @@ class LazySupervisedDataset(Dataset):
                                   self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
                                   ds_name=self.ds_name, num_image=num_image)
 
+        question = data_item['conversations'][0]['value']
+        target = data_item['conversations'][1]['value']
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            question=question,
+            target=target
         )
         return ret
 
@@ -461,13 +471,18 @@ class LazySupervisedDataset(Dataset):
                                   self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
                                   ds_name=self.ds_name, num_image=num_patches)
 
+        question = data_item['conversations'][0]['value']
+        target = data_item['conversations'][1]['value']
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            question=question,
+            target=target
         )
         return ret
 
@@ -498,13 +513,18 @@ class LazySupervisedDataset(Dataset):
                                   self.tokenizer, [self.num_image_token * num_patches], text_only=True,
                                   group_by_length=self.group_by_length, ds_name=self.ds_name)
 
+        question = data_item['conversations'][0]['value']
+        target = data_item['conversations'][1]['value']
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([0] * num_patches, dtype=torch.long)
+            image_flags=torch.tensor([0] * num_patches, dtype=torch.long),
+            question=question,
+            target=target
         )
         return ret
 
