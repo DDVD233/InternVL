@@ -42,7 +42,8 @@ class InternVLChatModel(PreTrainedModel):
                          'Phi3DecoderLayer', 'Qwen2DecoderLayer']
     _supports_flash_attn_2 = True
 
-    def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None):
+    def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None,
+                 vision_only=False, vision_output_size=-1):
         super().__init__(config)
 
         assert version_cmp(transformers.__version__, '4.37.0', 'ge')
@@ -85,6 +86,20 @@ class InternVLChatModel(PreTrainedModel):
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size)
         )
+
+        self.vision_only = vision_only
+        if vision_only:
+            self.language_model = None
+            self.mlp1 = None
+            self.fc = nn.Sequential(
+                nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio) ** 2 * self.num_image_token, vision_output_size),
+                nn.Sigmoid()
+            )
+            # init_weights
+            for m in self.fc.modules():
+                if isinstance(m, nn.Linear):
+                    m.weight.data.normal_(mean=0.0, std=0.02)
+                    m.bias.data.zero_()
 
         self.img_context_token_id = None
         self.conv_template = get_conv_template(self.template)
@@ -131,6 +146,18 @@ class InternVLChatModel(PreTrainedModel):
         self.language_model = get_peft_model(self.language_model, lora_config)
         self.language_model.enable_input_require_grads()
         self.language_model.print_trainable_parameters()
+
+    def forward_vision(self, pixel_values):
+        assert self.vision_only, "This method is only available in vision_only mode."
+        b, n, c, h, w = pixel_values.shape
+        pixel_values = pixel_values.view(b * n, c, h, w)
+        pixel_values = pixel_values.to(self.vision_model.dtype)
+        features = self.extract_feature(pixel_values)
+        b, np, c = features.shape
+        features = features.view(b, n, np * c)
+        # mean pooling over patches
+        features = features.mean(dim=1)
+        return self.fc(features)
 
     def forward(
             self,
@@ -248,7 +275,8 @@ class InternVLChatModel(PreTrainedModel):
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        vit_embeds = self.mlp1(vit_embeds)
+        if not self.vision_only:
+            vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
     def batch_chat(self, tokenizer, pixel_values, questions, generation_config, num_patches_list=None,
