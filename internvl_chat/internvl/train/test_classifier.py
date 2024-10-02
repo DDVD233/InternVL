@@ -225,7 +225,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         subset = dataset
 
     dataloader = torch.utils.data.DataLoader(subset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
-                                             num_workers=16, pin_memory=True)
+                                             num_workers=32, pin_memory=True)
 
     with torch.no_grad():
         bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}')
@@ -234,6 +234,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             labels = batch['labels'].to(device)
             datasets = batch['dataset']
             outputs = model.forward_vision(pixel_values)
+            outputs = torch.sigmoid(outputs)
 
             for output, label, ds in zip(outputs, labels, datasets):
                 dataset_outputs[ds].append(output.float().cpu().numpy())
@@ -282,11 +283,12 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             logger.info(f"Dataset {ds}: {stats}")
 
             # Accumulate for overall statistics
+            ds_length = len(ds_labels)
             if auc is not None:
-                overall_stats['auc'].append(auc)
-            overall_stats['accuracy'].append(accuracy)
-            overall_stats['sensitivity'].append(sensitivity)
-            overall_stats['specificity'].append(specificity)
+                overall_stats['auc'].extend([auc] * ds_length)
+            overall_stats['accuracy'].extend([accuracy] * ds_length)
+            overall_stats['sensitivity'].extend([sensitivity] * ds_length)
+            overall_stats['specificity'].extend([specificity] * ds_length)
         except ValueError:
             logger.error(f'Error calculating accuracy for {ds}')
             logger.error(f'Labels: {ds_labels}, predictions: {predictions}')
@@ -338,9 +340,9 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
 
     # Load the dataset
     dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=collate_fn,
-                                             num_workers=16, pin_memory=True, persistent_workers=True)
+                                             num_workers=32, pin_memory=True, persistent_workers=True)
 
-    loss_fn = torch.nn.BCELoss()
+    loss_fn = torch.nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     # Count trainable parameters
@@ -372,9 +374,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
             wandb.log(stats)
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
-            if step % 500 == 0:
+            if step % 500 == 0 and step > 0:
                 evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs, num_samples=8000)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs, num_samples=-1)
+            if step == 10:
+                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs, num_samples=8000)
             step += 1
 
     # Save the model via huggingface
