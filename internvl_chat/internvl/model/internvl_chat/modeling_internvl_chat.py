@@ -91,10 +91,7 @@ class InternVLChatModel(PreTrainedModel):
         if vision_only:
             self.language_model = None
             self.mlp1 = None
-            self.fc = nn.Sequential(
-                nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio) ** 2 * self.num_image_token, vision_output_size),
-                nn.Sigmoid()
-            )
+            self.fc = nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio) ** 2 * self.num_image_token, vision_output_size)
             # init_weights
             for m in self.fc.modules():
                 if isinstance(m, nn.Linear):
