@@ -1,7 +1,8 @@
 import argparse
-from typing import Dict
+from typing import Dict, List
 
 import wandb
+from torch import nn
 
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 import gc
@@ -24,6 +25,7 @@ from collections import defaultdict
 import tqdm
 import wandb
 import logging
+import torch.nn.functional as F
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -43,7 +45,7 @@ def collate_fn(batch):
     # Convert targets to a list of lists
     targets = [item['targets'] for item in batch]
 
-    return {
+    return_dict = {
         'pixel_values': pixel_values,
         'labels': labels,
         'questions': padded_questions,
@@ -51,28 +53,34 @@ def collate_fn(batch):
         'dataset': dataset
     }
 
+    if 'positive' in batch[0]:
+        return_dict['positive'] = torch.stack([item['positive'] for item in batch])
+        return_dict['negative'] = torch.stack([item['negative'] for item in batch])
+
+    return return_dict
+
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(
-        self,
-        meta_path,
-        num_image_token,
-        image_size=448,
-        is_train=False,
-        pad2square=False,
-        group_by_length=False,
-        dynamic_image_size=False,
-        use_thumbnail=False,
-        min_dynamic_patch=1,
-        max_dynamic_patch=9,
-        min_num_frame=4,  # for video data
-        max_num_frame=12,  # for video data
-        sampling_method='rand',  # for video data
-        normalize_type='imagenet',
-        random_seed=0,
-        rebuild_vocab=False
+            self,
+            meta_path,
+            num_image_token,
+            image_size=448,
+            is_train=False,
+            pad2square=False,
+            group_by_length=False,
+            dynamic_image_size=False,
+            use_thumbnail=False,
+            min_dynamic_patch=1,
+            max_dynamic_patch=9,
+            min_num_frame=4,  # for video data
+            max_num_frame=12,  # for video data
+            sampling_method='rand',  # for video data
+            normalize_type='imagenet',
+            random_seed=0,
+            rebuild_vocab=False
     ):
         super(LazySupervisedDataset, self).__init__()
         self.num_image_token = num_image_token
@@ -132,7 +140,7 @@ class LazySupervisedDataset(Dataset):
         with open(vocab_path, 'w') as f:
             json.dump(vocabs, f)
 
-        self.data_items = data_items
+        self.data_items: List[Dict] = data_items
         self.vocabs = vocabs
         self.vocabs_to_index = vocabs_to_index
 
@@ -211,6 +219,94 @@ class LazySupervisedDataset(Dataset):
         data_item = self.data_items[i]
         ret = self.multi_modal_get_item(data_item)
         return ret
+
+
+class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dataset_label_to_indices = defaultdict(dict)
+        self.label_set = set()
+
+        for idx, item in enumerate(self.data_items):
+            label_tuple = tuple(item['labels'])
+            dataset = item['dataset']
+            if label_tuple not in self.dataset_label_to_indices[dataset]:
+                self.dataset_label_to_indices[dataset][label_tuple] = []
+            self.dataset_label_to_indices[dataset][label_tuple].append(idx)
+            self.label_set.add(label_tuple)
+
+        # Pre-compute different labels for each label
+        self.different_labels = {
+            label: list(self.label_set - {label}) for label in self.label_set
+        }
+
+        # Log some statistics
+        logger.info(f"Total number of samples: {len(self.data_items)}")
+        logger.info(f"Number of unique labels: {len(self.label_set)}")
+        logger.info(f"Number of datasets: {len(self.dataset_label_to_indices)}")
+
+    def __getitem__(self, i):
+        i = i % len(self.data_items)
+        anchor_item = self.data_items[i]
+        anchor_label = tuple(anchor_item['labels'])
+
+        # Get the anchor image
+        anchor_ret = self.multi_modal_get_item(anchor_item)
+        anchor_dataset = anchor_item['dataset']
+
+        # Get a positive sample (same label, can be from any dataset)
+        positive_indices = []
+        for dataset_labels in self.dataset_label_to_indices.values():
+            if anchor_label in dataset_labels:
+                positive_indices.extend(dataset_labels[anchor_label])
+
+        if not positive_indices:
+            logger.warning(f"No positive samples found for label {anchor_label}")
+            positive_idx = i  # Use the anchor as positive if no other positives found
+        else:
+            positive_idx = random.choice(positive_indices)
+        positive_item = self.data_items[positive_idx]
+        positive_ret = self.multi_modal_get_item(positive_item)
+
+        # Get a negative sample (different label, same dataset)
+        available_labels = list(self.dataset_label_to_indices[anchor_dataset].keys())
+        if len(available_labels) > 1:
+            # Remove the anchor label from available labels
+            available_labels = [label for label in available_labels if label != anchor_label]
+            negative_label = random.choice(available_labels)
+            negative_indices = self.dataset_label_to_indices[anchor_dataset][negative_label]
+            negative_idx = random.choice(negative_indices)
+        else:
+            logger.warning(f"Only one label in dataset {anchor_dataset}. Sampling from a different dataset.")
+            other_datasets = [ds for ds in self.dataset_label_to_indices.keys() if ds != anchor_dataset]
+            if not other_datasets:
+                logger.error("No other datasets available for negative sampling.")
+                negative_idx = (i + 1) % len(self.data_items)  # Use next item as negative
+            else:
+                negative_dataset = random.choice(other_datasets)
+                negative_label = random.choice(list(self.dataset_label_to_indices[negative_dataset].keys()))
+                negative_indices = self.dataset_label_to_indices[negative_dataset][negative_label]
+                negative_idx = random.choice(negative_indices)
+
+        negative_item = self.data_items[negative_idx]
+        negative_ret = self.multi_modal_get_item(negative_item)
+
+        return {
+            'pixel_values': anchor_ret['pixel_values'],
+            'positive': positive_ret['pixel_values'],
+            'negative': negative_ret['pixel_values'],
+            'labels': anchor_ret['labels'],
+            'targets': anchor_ret['targets'],
+            'question': anchor_ret['question'],
+            'dataset': anchor_ret['dataset'],
+        }
+
+
+def contrastive_loss(anchor, positive, negative, margin=1.0):
+    distance_positive = F.pairwise_distance(anchor, positive)
+    distance_negative = F.pairwise_distance(anchor, negative)
+    losses = torch.relu(distance_positive - distance_negative + margin)
+    return losses.mean()
 
 
 def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samples=-1):
@@ -316,12 +412,13 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
     model.train()
 
 
-def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False):
+def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False,
+                     max_grad_norm=2.0, contrastive_weight=0.5):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     wandb.init(project='high_modality')
-    train_dataset = LazySupervisedDataset('../../../processing/meta_train.json',
-                                          num_image_token=256, rebuild_vocab=True)
+    train_dataset = ContrastiveLazySupervisedDataset('../../../processing/meta_train.json',
+                                                     num_image_token=256, rebuild_vocab=True)
     val_dataset = LazySupervisedDataset('../../../processing/meta_valid.json', num_image_token=256)
     vocab_size = len(train_dataset.vocabs)
 
@@ -346,27 +443,41 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     # Count trainable parameters
-    trainable_params = 0
-    for param in model.parameters():
-        if param.requires_grad:
-            trainable_params += param.numel()
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f'Trainable parameters: {trainable_params}')
 
     # Train the model
     step = 0
     for epoch in range(epochs):
         for batch in dataloader:
-            pixel_values = batch['pixel_values'].cuda()
-            outputs = model.forward_vision(pixel_values)
-            labels = batch['labels'].cuda().to(outputs.dtype)
-            loss = loss_fn(outputs, labels)
+            pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
+            positive_values = batch['positive'].cuda().to(torch.bfloat16)
+            negative_values = batch['negative'].cuda().to(torch.bfloat16)
+            labels = batch['labels'].cuda().to(torch.bfloat16)
 
-            loss.backward()
+            positive_outputs = model.forward_vision(positive_values, classify=False)
+            negative_outputs = model.forward_vision(negative_values, classify=False)
+            features = model.forward_vision(pixel_values, classify=False)
+            outputs = model.classify(features)
+
+            classification_loss = loss_fn(outputs, labels)
+            contr_loss = contrastive_loss(features, positive_outputs, negative_outputs)
+
+            # Backward pass
+            total_loss = classification_loss + contrastive_weight * contr_loss
+            total_loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+            # Optimizer step
             optimizer.step()
             optimizer.zero_grad()
 
             stats = {
-                'loss': loss.item(),
+                'loss': total_loss.item(),
+                'classification_loss': classification_loss.item(),
+                'contrastive_loss': contr_loss.item(),
                 'step': step,
                 'lr': lr,
                 'epoch': epoch
@@ -375,10 +486,12 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
             if step % 500 == 0 and step > 0:
-                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs, num_samples=8000)
+                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
+                                    num_samples=8000)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs, num_samples=-1)
             if step == 10:
-                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs, num_samples=8000)
+                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
+                                    num_samples=8000)
             step += 1
 
     # Save the model via huggingface
