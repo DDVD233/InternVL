@@ -144,7 +144,7 @@ class InternVLChatModel(PreTrainedModel):
         self.language_model.enable_input_require_grads()
         self.language_model.print_trainable_parameters()
 
-    def forward_vision(self, pixel_values):
+    def forward_vision(self, pixel_values, classify=True):
         assert self.vision_only, "This method is only available in vision_only mode."
         b, n, c, h, w = pixel_values.shape
         pixel_values = pixel_values.view(b * n, c, h, w)
@@ -154,6 +154,12 @@ class InternVLChatModel(PreTrainedModel):
         features = features.view(b, n, np * c)
         # mean pooling over patches
         features = features.mean(dim=1)
+        if classify:
+            return self.classify(features)
+        else:
+            return features
+
+    def classify(self, features):
         return self.fc(features)
 
     def forward(
