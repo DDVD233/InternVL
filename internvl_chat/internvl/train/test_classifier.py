@@ -26,6 +26,7 @@ import tqdm
 import wandb
 import logging
 import torch.nn.functional as F
+import libauc.losses as auc_losses
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -35,6 +36,27 @@ logger = logging.getLogger(__name__)
 def collate_fn(batch):
     pixel_values = torch.stack([item['pixel_values'] for item in batch])
     labels = torch.stack([torch.tensor(item['labels'], dtype=torch.float32) for item in batch])
+
+    if 'positive' in batch[0]:
+        positive_values = torch.stack([item['positive'] for item in batch])
+        # Generate multiple negative indices within the batch
+        batch_size = len(batch)
+        negative_indices = []
+        for i in range(batch_size):
+            # Find indices of samples with different labels
+            neg_indices = [j for j in range(batch_size) if not torch.all(labels[i] == labels[j])]
+            if not neg_indices:  # If no different labels found, use all other indices
+                neg_indices = [j for j in range(batch_size) if j != i]
+            negative_indices.append(neg_indices)
+
+        # Pad negative indices to the same length
+        max_neg_count = max(len(indices) for indices in negative_indices)
+        padded_negative_indices = [indices + [indices[-1]] * (max_neg_count - len(indices)) for indices in
+                                   negative_indices]
+        padded_negative_indices = torch.tensor(padded_negative_indices)
+    else:
+        positive_values = None
+        padded_negative_indices = None
 
     # Padding questions to the same length
     questions = [item['question'] for item in batch]
@@ -47,15 +69,13 @@ def collate_fn(batch):
 
     return_dict = {
         'pixel_values': pixel_values,
+        'positive': positive_values,
         'labels': labels,
         'questions': padded_questions,
         'targets': targets,
-        'dataset': dataset
+        'dataset': dataset,
+        'negative_indices': padded_negative_indices
     }
-
-    if 'positive' in batch[0]:
-        return_dict['positive'] = torch.stack([item['positive'] for item in batch])
-        return_dict['negative'] = torch.stack([item['negative'] for item in batch])
 
     return return_dict
 
@@ -95,6 +115,7 @@ class LazySupervisedDataset(Dataset):
         self.max_num_frame = max_num_frame
         self.min_num_frame = min_num_frame
         self.sampling_method = sampling_method
+        self.normalize_type = normalize_type
 
         logger.info('Formatting inputs...Skip in lazy mode')
 
@@ -140,6 +161,11 @@ class LazySupervisedDataset(Dataset):
         with open(vocab_path, 'w') as f:
             json.dump(vocabs, f)
 
+        # calculate positive ratio
+        agg_labels = torch.tensor([data['labels'] for data in data_items])
+        self.positive_ratio = agg_labels.sum(dim=0) / len(agg_labels)
+        self.positive_ratio = self.positive_ratio.cpu().tolist()
+
         self.data_items: List[Dict] = data_items
         self.vocabs = vocabs
         self.vocabs_to_index = vocabs_to_index
@@ -153,7 +179,6 @@ class LazySupervisedDataset(Dataset):
         self.use_thumbnail = use_thumbnail
         self.min_dynamic_patch = min_dynamic_patch
         self.max_dynamic_patch = max_dynamic_patch
-        self.normalize_type = normalize_type
         gc.collect()
 
     def build_vocab(self, vocab_path, vocabs):
@@ -268,33 +293,9 @@ class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
         positive_item = self.data_items[positive_idx]
         positive_ret = self.multi_modal_get_item(positive_item)
 
-        # Get a negative sample (different label, same dataset)
-        available_labels = list(self.dataset_label_to_indices[anchor_dataset].keys())
-        if len(available_labels) > 1:
-            # Remove the anchor label from available labels
-            available_labels = [label for label in available_labels if label != anchor_label]
-            negative_label = random.choice(available_labels)
-            negative_indices = self.dataset_label_to_indices[anchor_dataset][negative_label]
-            negative_idx = random.choice(negative_indices)
-        else:
-            logger.warning(f"Only one label in dataset {anchor_dataset}. Sampling from a different dataset.")
-            other_datasets = [ds for ds in self.dataset_label_to_indices.keys() if ds != anchor_dataset]
-            if not other_datasets:
-                logger.error("No other datasets available for negative sampling.")
-                negative_idx = (i + 1) % len(self.data_items)  # Use next item as negative
-            else:
-                negative_dataset = random.choice(other_datasets)
-                negative_label = random.choice(list(self.dataset_label_to_indices[negative_dataset].keys()))
-                negative_indices = self.dataset_label_to_indices[negative_dataset][negative_label]
-                negative_idx = random.choice(negative_indices)
-
-        negative_item = self.data_items[negative_idx]
-        negative_ret = self.multi_modal_get_item(negative_item)
-
         return {
             'pixel_values': anchor_ret['pixel_values'],
             'positive': positive_ret['pixel_values'],
-            'negative': negative_ret['pixel_values'],
             'labels': anchor_ret['labels'],
             'targets': anchor_ret['targets'],
             'question': anchor_ret['question'],
@@ -302,10 +303,27 @@ class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
         }
 
 
-def contrastive_loss(anchor, positive, negative, margin=1.0):
-    distance_positive = F.pairwise_distance(anchor, positive)
-    distance_negative = F.pairwise_distance(anchor, negative)
-    losses = torch.relu(distance_positive - distance_negative + margin)
+def contrastive_loss(anchor, positive, negative_indices, temperature=0.07):
+    batch_size = anchor.size(0)
+
+    # Compute similarity between anchor and positive
+    sim_positive = F.cosine_similarity(anchor, positive, dim=1) / temperature
+
+    # Compute similarities between anchor and all negative samples
+    neg_sims = torch.empty(batch_size, negative_indices.size(1), device=anchor.device)
+    for i in range(batch_size):
+        neg_sims[i] = F.cosine_similarity(
+            anchor[i].unsqueeze(0),
+            anchor[negative_indices[i]],
+            dim=1
+        ) / temperature
+
+    # Concatenate positive and negative similarities
+    all_sims = torch.cat([sim_positive.unsqueeze(1), neg_sims], dim=1)
+
+    # Compute the loss using logsumexp
+    losses = -sim_positive + torch.logsumexp(all_sims, dim=1)
+
     return losses.mean()
 
 
@@ -342,7 +360,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         'auc': [],
         'accuracy': [],
         'sensitivity': [],
-        'specificity': []
+        'specificity': [],
+        'perfect_match': []
     }
 
     for ds in dataset_outputs.keys():
@@ -363,6 +382,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         predictions = (ds_outputs > 0.5).astype(int)
         try:
             accuracy = 1 - hamming_loss(ds_labels, predictions)
+            # also calculate perfect match accuracy
+            perfect_match = (ds_labels == predictions).all(axis=1).mean()
             # Calculate sensitivity and specificity
             cm = confusion_matrix(ds_labels.ravel(), predictions.ravel())
             sensitivity = cm[1, 1] / (cm[1, 1] + cm[1, 0])
@@ -374,6 +395,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
                 f'{ds}/{split}/accuracy': accuracy,
                 f'{ds}/{split}/sensitivity': sensitivity,
                 f'{ds}/{split}/specificity': specificity,
+                f'{ds}/{split}/perfect_match': perfect_match,
             }
             wandb.log(stats)
             logger.info(f"Dataset {ds}: {stats}")
@@ -385,6 +407,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             overall_stats['accuracy'].extend([accuracy] * ds_length)
             overall_stats['sensitivity'].extend([sensitivity] * ds_length)
             overall_stats['specificity'].extend([specificity] * ds_length)
+            overall_stats['perfect_match'].extend([perfect_match] * ds_length)
         except ValueError:
             logger.error(f'Error calculating accuracy for {ds}')
             logger.error(f'Labels: {ds_labels}, predictions: {predictions}')
@@ -401,6 +424,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             f'{split}/overall_accuracy': overall_accuracy,
             f'{split}/overall_sensitivity': overall_sensitivity,
             f'{split}/overall_specificity': overall_specificity,
+            f'{split}/overall_perfect_match': np.mean(overall_stats['perfect_match']),
             'step': step,
             'epoch': epoch
         }
@@ -413,12 +437,15 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
 
 
 def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False,
-                     max_grad_norm=2.0, contrastive_weight=0.5):
+                     max_grad_norm=2.0, contrastive_weight=0.5, auc_margin=4.0, sampling_rate=0.5):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     wandb.init(project='high_modality')
     train_dataset = ContrastiveLazySupervisedDataset('../../../processing/meta_train.json',
-                                                     num_image_token=256, rebuild_vocab=True)
+                                                     num_image_token=256, rebuild_vocab=True, is_train=True)
+    # sampler = DualSampler(train_dataset, batch_size=bs, sampling_rate=sampling_rate, shuffle=True)
+
+    train_val_dataset = LazySupervisedDataset('../../../processing/meta_train.json', num_image_token=256)
     val_dataset = LazySupervisedDataset('../../../processing/meta_valid.json', num_image_token=256)
     vocab_size = len(train_dataset.vocabs)
 
@@ -437,14 +464,21 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
 
     # Load the dataset
     dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=collate_fn,
-                                             num_workers=32, pin_memory=True, persistent_workers=True)
+                                             num_workers=32, pin_memory=True, persistent_workers=True,
+                                             prefetch_factor=8)
 
     loss_fn = torch.nn.BCEWithLogitsLoss()
+    auc_loss_fn = auc_losses.MultiLabelAUCMLoss(margin=auc_margin, version='v1', num_labels=vocab_size,
+                                                device=device, imratio=train_dataset.positive_ratio)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f'Trainable parameters: {trainable_params}')
+
+    # save vocab to output path
+    with open(os.path.join(output_path, 'vocabs.json'), 'w') as f:
+        json.dump(train_dataset.vocabs, f)
 
     # Train the model
     step = 0
@@ -452,19 +486,23 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
         for batch in dataloader:
             pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
             positive_values = batch['positive'].cuda().to(torch.bfloat16)
-            negative_values = batch['negative'].cuda().to(torch.bfloat16)
             labels = batch['labels'].cuda().to(torch.bfloat16)
+            negative_indices = batch['negative_indices'].cuda()
 
-            positive_outputs = model.forward_vision(positive_values, classify=False)
-            negative_outputs = model.forward_vision(negative_values, classify=False)
             features = model.forward_vision(pixel_values, classify=False)
+            positive_outputs = model.forward_vision(positive_values, classify=False)
             outputs = model.classify(features)
 
             classification_loss = loss_fn(outputs, labels)
-            contr_loss = contrastive_loss(features, positive_outputs, negative_outputs)
+            contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
+
+            if step > 5050:
+                auc_loss = auc_loss_fn(outputs, labels)
+            else:
+                auc_loss = torch.tensor(0.0).to(device)
 
             # Backward pass
-            total_loss = classification_loss + contrastive_weight * contr_loss
+            total_loss = classification_loss + contrastive_weight * contr_loss + auc_loss
             total_loss.backward()
 
             # Gradient clipping
@@ -478,6 +516,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
                 'loss': total_loss.item(),
                 'classification_loss': classification_loss.item(),
                 'contrastive_loss': contr_loss.item(),
+                'auc_loss': auc_loss.item(),
                 'step': step,
                 'lr': lr,
                 'epoch': epoch
@@ -486,12 +525,16 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
             if step % 500 == 0 and step > 0:
-                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
+                evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs, num_samples=-1)
-            if step == 10:
-                evaluate_classifier(model, train_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
+            if step == 100:
+                evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000)
+            # save every 1000 steps
+            if step % 1000 == 0:
+                checkpoint_path = os.path.join(output_path, f'checkpoint_{step}.pt')
+                torch.save(model.state_dict(), checkpoint_path)
             step += 1
 
     # Save the model via huggingface

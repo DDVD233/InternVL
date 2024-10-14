@@ -38,7 +38,7 @@ class FlashAttention(nn.Module):
             key_padding_mask: a bool tensor of shape (B, S)
         """
         assert not need_weights
-        assert qkv.dtype in [torch.float16, torch.bfloat16]
+        assert qkv.dtype in [torch.float16, torch.bfloat16], f"FlashAttention only supports float16 and bfloat16, but got {qkv.dtype}"
         assert qkv.is_cuda
 
         if cu_seqlens is None:
