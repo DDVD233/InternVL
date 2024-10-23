@@ -1,4 +1,5 @@
 import argparse
+import copy
 from typing import Dict, List
 
 import wandb
@@ -188,6 +189,19 @@ class LazySupervisedDataset(Dataset):
         with open(vocab_path, 'w') as f:
             json.dump(vocabs, f)
         return vocabs
+
+    def save_annotation(self, path, rel_path):
+        # save all the data items to a json file
+        relative_data = []
+
+        for data in self.data_items:
+            relative_images = [os.path.relpath(image, rel_path) for image in data['images']]
+            copy_data = copy.deepcopy(data)
+            copy_data['images'] = relative_images
+            relative_data.append(copy_data)
+
+        with open(path, 'w') as f:
+            json.dump(relative_data, f)
 
     def __len__(self):
         return len(self.data_items)
@@ -437,7 +451,9 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
 
 
 def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False,
-                     max_grad_norm=2.0, contrastive_weight=0.5, auc_margin=4.0, sampling_rate=0.5):
+                     max_grad_norm=2.0, contrastive_weight=0.5, auc_margin=4.0,
+                     meta_train_path='../../../processing/meta_train.json',
+                     meta_valid_path='../../../processing/meta_valid.json'):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     wandb.init(project='high_modality')
@@ -445,8 +461,12 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
                                                      num_image_token=256, rebuild_vocab=True, is_train=True)
     # sampler = DualSampler(train_dataset, batch_size=bs, sampling_rate=sampling_rate, shuffle=True)
 
-    train_val_dataset = LazySupervisedDataset('../../../processing/meta_train.json', num_image_token=256)
-    val_dataset = LazySupervisedDataset('../../../processing/meta_valid.json', num_image_token=256)
+    train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256)
+    val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256)
+    train_dataset.save_annotation(meta_train_path,
+                                  rel_path='/home/dvd/Datasets/high_modality/')
+    val_dataset.save_annotation(meta_valid_path,
+                                rel_path='/home/dvd/Datasets/high_modality/')
     vocab_size = len(train_dataset.vocabs)
 
     # Load the model
@@ -477,7 +497,8 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     logger.info(f'Trainable parameters: {trainable_params}')
 
     # save vocab to output path
-    with open(os.path.join(output_path, 'vocabs.json'), 'w') as f:
+    meta_train_name = os.path.basename(meta_train_path)
+    with open(os.path.join(output_path, f'{meta_train_name}_vocabs.json'), 'w') as f:
         json.dump(train_dataset.vocabs, f)
 
     # Train the model
@@ -550,7 +571,10 @@ if __name__ == '__main__':
     arg_parser.add_argument('--bs', type=int, default=64)
     arg_parser.add_argument('--epochs', type=int, default=10)
     arg_parser.add_argument('--freeze_vision', action='store_true')
+    arg_parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json')
+    arg_parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_valid.json')
 
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
-                     lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision)
+                     lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
+                     meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path)
