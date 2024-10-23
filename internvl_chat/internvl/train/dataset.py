@@ -27,8 +27,6 @@ from internvl.conversation import get_conv_template
 from PIL import Image
 from torch.utils.data import ConcatDataset, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode
-# import albumentations as A
-# from albumentations.pytorch import ToTensorV2
 import numpy as np
 
 from .constants import (CLIP_MEAN, CLIP_STD, IMAGENET_MEAN, IMAGENET_STD,
@@ -288,37 +286,6 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type='imag
         raise NotImplementedError
 
     if is_train:
-        # albu_transform = A.Compose([
-        #     A.Transpose(p=0.5),
-        #     A.VerticalFlip(p=0.5),
-        #     A.HorizontalFlip(p=0.5),
-        #     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.75),
-        #     A.OneOf([
-        #         A.MotionBlur(blur_limit=5),
-        #         A.MedianBlur(blur_limit=5),
-        #         A.GaussianBlur(blur_limit=5),
-        #         A.GaussNoise(var_limit=(5.0, 30.0)),
-        #     ], p=0.7),
-        #     A.OneOf([
-        #         A.OpticalDistortion(distort_limit=1.0),
-        #         A.GridDistortion(num_steps=5, distort_limit=1.),
-        #         A.ElasticTransform(alpha=3),
-        #     ], p=0.7),
-        #     A.CLAHE(clip_limit=4.0, p=0.7),
-        #     A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.5),
-        #     A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, border_mode=0, p=0.85),
-        #     A.Resize(input_size, input_size),
-        #     A.CoarseDropout(
-        #         max_holes=1,
-        #         max_height=int(input_size * 0.375),
-        #         max_width=int(input_size * 0.375),
-        #         min_holes=1,
-        #         min_height=int(input_size * 0.375 / 2),  # Half of max_height
-        #         min_width=int(input_size * 0.375 / 2),  # Half of max_width
-        #         fill_value=0,
-        #         p=0.7
-        #     ),
-        # ])
 
         # transform = T.Compose([
         #     T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
@@ -329,17 +296,15 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type='imag
         transform = T.Compose([
             T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             T.RandomHorizontalFlip(p=0.5),
-            T.RandomVerticalFlip(p=0.5),
+            # T.RandomVerticalFlip(p=0.5),
+            T.RandomRotation(degrees=10),
             T.RandomApply([
                 T.ColorJitter(brightness=0.2, contrast=0.2)
-            ], p=0.75),
-            T.RandomApply([
-                T.GaussianBlur(kernel_size=5)
-            ], p=0.7),
-            T.RandomAdjustSharpness(sharpness_factor=2, p=0.7),
+            ], p=0.2),
+            T.RandomAdjustSharpness(sharpness_factor=2, p=0.2),
             T.RandomApply([
                 T.ColorJitter(hue=0.1, saturation=0.2)
-            ], p=0.5),
+            ], p=0.1),
             T.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1),
                            interpolation=InterpolationMode.BILINEAR),
             T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
@@ -347,8 +312,8 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type='imag
             T.Normalize(mean=MEAN, std=STD),
             T.RandomApply([
                 T.ElasticTransform(alpha=50.0, sigma=5.0)
-            ], p=0.7),
-            T.RandomErasing(p=0.7, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0)
+            ], p=0.2),
+            T.RandomErasing(p=0.1, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0)
         ])
     else:
         if pad2square is False:
