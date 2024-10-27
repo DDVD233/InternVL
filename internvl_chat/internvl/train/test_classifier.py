@@ -141,7 +141,9 @@ class LazySupervisedDataset(Dataset):
                     data_items.append(data)
                     bar.update(1)
 
-        vocab_path = os.path.join(os.path.dirname(meta_path), 'vocabs.json')
+        meta_name = os.path.basename(meta_path).replace('.json', '').replace('_train', '').replace('_valid', '')
+
+        vocab_path = os.path.join(os.path.dirname(meta_path), f'{meta_name}_vocabs.json')
         if not os.path.exists(vocab_path) or rebuild_vocab:
             logger.info('Building vocab...')
             vocabs = self.build_vocab(vocab_path, vocabs)
@@ -150,6 +152,8 @@ class LazySupervisedDataset(Dataset):
         else:
             with open(vocab_path, 'r') as f:
                 vocabs = json.load(f)
+            logger.info(f'Loaded vocab size: {len(vocabs)}')
+            logger.info(f'Loaded vocab: {vocabs}')
         vocabs_to_index = {v: i for i, v in enumerate(vocabs)}
         for data in data_items:
             labels = [0] * len(vocabs)
@@ -158,6 +162,7 @@ class LazySupervisedDataset(Dataset):
                     labels[vocabs_to_index[target]] = 1
                 else:
                     labels[-1] = 1  # unk
+                    logger.warning(f'Unknown label: {target}')
             data['labels'] = labels
         with open(vocab_path, 'w') as f:
             json.dump(vocabs, f)
@@ -201,7 +206,7 @@ class LazySupervisedDataset(Dataset):
             relative_data.append(copy_data)
 
         with open(path, 'w') as f:
-            json.dump(relative_data, f)
+            json.dump(rel_path, f)
 
     def __len__(self):
         return len(self.data_items)
@@ -457,21 +462,20 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     wandb.init(project='high_modality')
-    train_dataset = ContrastiveLazySupervisedDataset('../../../processing/meta_train.json',
+    train_dataset = ContrastiveLazySupervisedDataset(meta_train_path,
                                                      num_image_token=256, rebuild_vocab=True, is_train=True)
     # sampler = DualSampler(train_dataset, batch_size=bs, sampling_rate=sampling_rate, shuffle=True)
 
     train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256)
-    val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256)
-    train_dataset.save_annotation(meta_train_path,
-                                  rel_path='/home/dvd/Datasets/high_modality/')
-    val_dataset.save_annotation(meta_valid_path,
-                                rel_path='/home/dvd/Datasets/high_modality/')
+    val_dataset = LazySupervisedDataset(meta_valid_path, num_image_token=256)
+    # train_dataset.save_annotation(meta_train_path,
+    #                               rel_path='/home/dvd/Datasets/high_modality/')
+    # val_dataset.save_annotation(meta_valid_path,
+    #                             rel_path='/home/dvd/Datasets/high_modality/')
     vocab_size = len(train_dataset.vocabs)
 
     # Load the model
-    model = InternVLChatModel.from_pretrained(model_path,
-                                              vision_only=True, vision_output_size=vocab_size,
+    model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                               torch_dtype=torch.bfloat16)
     model.train()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -498,7 +502,8 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
 
     # save vocab to output path
     meta_train_name = os.path.basename(meta_train_path)
-    with open(os.path.join(output_path, f'{meta_train_name}_vocabs.json'), 'w') as f:
+    meta_name = meta_train_name.replace('_train', '').replace('.json', '')
+    with open(os.path.join(output_path, f'{meta_name}_vocabs.json'), 'w') as f:
         json.dump(train_dataset.vocabs, f)
 
     # Train the model
@@ -567,7 +572,7 @@ if __name__ == '__main__':
     arg_parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL2-8B')
     arg_parser.add_argument('--output_path', type=str, required=True)
     arg_parser.add_argument('--lr', type=float, default=1e-5)
-    arg_parser.add_argument('--wd', type=float, default=1e-3)
+    arg_parser.add_argument('--wd', type=float, default=0)
     arg_parser.add_argument('--bs', type=int, default=64)
     arg_parser.add_argument('--epochs', type=int, default=10)
     arg_parser.add_argument('--freeze_vision', action='store_true')
