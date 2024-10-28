@@ -458,7 +458,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
 def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False,
                      max_grad_norm=2.0, contrastive_weight=0.5, auc_margin=4.0,
                      meta_train_path='../../../processing/meta_train.json',
-                     meta_valid_path='../../../processing/meta_valid.json'):
+                     meta_valid_path='../../../processing/meta_valid.json',
+                     eval_only=False, load_checkpoint=None):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     wandb.init(project='high_modality')
@@ -495,6 +496,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     auc_loss_fn = auc_losses.MultiLabelAUCMLoss(margin=auc_margin, version='v1', num_labels=vocab_size,
                                                 device=device, imratio=train_dataset.positive_ratio)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+
+    if eval_only:
+        evaluate_classifier(model, train_val_dataset, device, 'train', bs=bs, step=0, epoch=0, num_samples=8000)
+        evaluate_classifier(model, val_dataset, device, 'val', bs=bs, step=0, epoch=0, num_samples=-1)
+        return
 
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -559,8 +565,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
                                     num_samples=8000)
             # save every 1000 steps
             if step % 1000 == 0:
-                checkpoint_path = os.path.join(output_path, f'checkpoint_{step}.pt')
-                torch.save(model.state_dict(), checkpoint_path)
+                model.save_pretrained(output_path)
             step += 1
 
     # Save the model via huggingface
