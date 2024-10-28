@@ -144,16 +144,31 @@ class InternVLChatModel(PreTrainedModel):
         self.language_model.enable_input_require_grads()
         self.language_model.print_trainable_parameters()
 
-    def forward_vision(self, pixel_values, classify=True):
+    def forward_vision(self, pixel_values, attention_mask=None, classify=True):
         assert self.vision_only, "This method is only available in vision_only mode."
         b, n, c, h, w = pixel_values.shape
         pixel_values = pixel_values.view(b * n, c, h, w)
         pixel_values = pixel_values.to(self.vision_model.dtype)
         features = self.extract_feature(pixel_values)
-        b, np, c = features.shape
+        b_n, np, c = features.shape
         features = features.view(b, n, np * c)
-        # mean pooling over patches
-        features = features.mean(dim=1)
+        if attention_mask is not None:
+            # Expand attention mask to match feature dimensions
+            attention_mask = attention_mask.to(features.dtype)  # Convert to same dtype as features
+            mask = attention_mask.unsqueeze(-1)  # Shape: (b, n, 1)
+
+            # Apply mask
+            features = features * mask  # Shape: (b, n, np*c)
+
+            # Mean pooling over non-padded frames only
+            # Sum features and divide by number of real frames (sum of mask)
+            features_sum = features.sum(dim=1)  # Shape: (b, np*c)
+            mask_sum = mask.sum(dim=1).clamp(min=1.0)  # Shape: (b, 1), clamp to avoid division by zero
+            features = features_sum / mask_sum  # Shape: (b, np*c)
+        else:
+            # Original mean pooling if no mask provided
+            features = features.mean(dim=1)  # Shape: (b, np*c)
+
         if classify:
             return self.classify(features)
         else:

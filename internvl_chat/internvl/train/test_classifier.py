@@ -2,6 +2,7 @@ import argparse
 import copy
 from typing import Dict, List
 
+import cv2
 import wandb
 from torch import nn
 
@@ -35,42 +36,89 @@ logger = logging.getLogger(__name__)
 
 
 def collate_fn(batch):
-    pixel_values = torch.stack([item['pixel_values'] for item in batch])
+    # Find max length of pixel_values in the batch
+    max_length = max(item['pixel_values'].size(0) for item in batch)
+
+    # Pad pixel_values and create attention masks
+    padded_pixel_values = []
+    attention_masks = []
+
+    for item in batch:
+        pixel_vals = item['pixel_values']
+        current_len = pixel_vals.size(0)
+
+        # Create padding
+        padding_size = max_length - current_len
+        padding = torch.zeros((padding_size,) + pixel_vals.size()[1:])
+
+        # Pad pixel values
+        padded = torch.cat([pixel_vals, padding], dim=0)
+        padded_pixel_values.append(padded)
+
+        # Create attention mask (1 for real values, 0 for padding)
+        mask = torch.ones(current_len, dtype=torch.long)
+        mask_padding = torch.zeros(padding_size, dtype=torch.long)
+        attention_mask = torch.cat([mask, mask_padding], dim=0)
+        attention_masks.append(attention_mask)
+
+    # Stack all padded values and masks
+    pixel_values = torch.stack(padded_pixel_values)
+    attention_mask = torch.stack(attention_masks)
     labels = torch.stack([torch.tensor(item['labels'], dtype=torch.float32) for item in batch])
 
     if 'positive' in batch[0]:
-        positive_values = torch.stack([item['positive'] for item in batch])
-        # Generate multiple negative indices within the batch
+        # Handle positive examples similarly with padding
+        max_pos_length = max(item['positive'].size(0) for item in batch)
+        padded_positive_values = []
+        positive_attention_masks = []
+
+        for item in batch:
+            pos_vals = item['positive']
+            current_len = pos_vals.size(0)
+
+            padding_size = max_pos_length - current_len
+            padding = torch.zeros((padding_size,) + pos_vals.size()[1:])
+
+            padded = torch.cat([pos_vals, padding], dim=0)
+            padded_positive_values.append(padded)
+
+            mask = torch.ones(current_len, dtype=torch.long)
+            mask_padding = torch.zeros(padding_size, dtype=torch.long)
+            pos_attention_mask = torch.cat([mask, mask_padding], dim=0)
+            positive_attention_masks.append(pos_attention_mask)
+
+        positive_values = torch.stack(padded_positive_values)
+        positive_attention_mask = torch.stack(positive_attention_masks)
+
+        # Generate negative indices
         batch_size = len(batch)
         negative_indices = []
         for i in range(batch_size):
-            # Find indices of samples with different labels
             neg_indices = [j for j in range(batch_size) if not torch.all(labels[i] == labels[j])]
-            if not neg_indices:  # If no different labels found, use all other indices
+            if not neg_indices:
                 neg_indices = [j for j in range(batch_size) if j != i]
             negative_indices.append(neg_indices)
 
-        # Pad negative indices to the same length
         max_neg_count = max(len(indices) for indices in negative_indices)
-        padded_negative_indices = [indices + [indices[-1]] * (max_neg_count - len(indices)) for indices in
-                                   negative_indices]
+        padded_negative_indices = [indices + [indices[-1]] * (max_neg_count - len(indices))
+                                   for indices in negative_indices]
         padded_negative_indices = torch.tensor(padded_negative_indices)
     else:
         positive_values = None
+        positive_attention_mask = None
         padded_negative_indices = None
 
-    # Padding questions to the same length
     questions = [item['question'] for item in batch]
     dataset = [item['dataset'] for item in batch]
     max_question_length = max(len(q) for q in questions)
     padded_questions = [q.ljust(max_question_length) for q in questions]
-
-    # Convert targets to a list of lists
     targets = [item['targets'] for item in batch]
 
     return_dict = {
         'pixel_values': pixel_values,
+        'attention_mask': attention_mask,
         'positive': positive_values,
+        'positive_attention_mask': positive_attention_mask,
         'labels': labels,
         'questions': padded_questions,
         'targets': targets,
@@ -79,6 +127,48 @@ def collate_fn(batch):
     }
 
     return return_dict
+
+
+def sample_frames(video_path: str, num_frames: int, is_train: bool) -> List[Image.Image]:
+    """
+    Sample frames from a video file.
+
+    Args:
+        video_path: Path to the video file
+        num_frames: Number of frames to sample
+        is_train: If True, use random sampling; if False, use uniform sampling
+
+    Returns:
+        List of PIL Images
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total_frames == 0:
+        raise ValueError(f"No frames found in video: {video_path}")
+
+    if is_train:
+        # Random sampling for training
+        frame_indices = sorted(random.sample(range(total_frames), min(num_frames, total_frames)))
+    else:
+        # Uniform sampling for testing
+        frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+
+    frames = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Convert to PIL Image
+            frame = Image.fromarray(frame)
+            frames.append(frame)
+        else:
+            raise ValueError(f"Failed to read frame {idx} from video: {video_path}")
+
+    cap.release()
+    return frames
 
 
 class LazySupervisedDataset(Dataset):
@@ -92,12 +182,12 @@ class LazySupervisedDataset(Dataset):
             is_train=False,
             pad2square=False,
             group_by_length=False,
-            dynamic_image_size=False,
+            dynamic_image_size=True,
             use_thumbnail=False,
             min_dynamic_patch=1,
-            max_dynamic_patch=9,
+            max_dynamic_patch=8,
             min_num_frame=4,  # for video data
-            max_num_frame=12,  # for video data
+            max_num_frame=8,  # for video data
             sampling_method='rand',  # for video data
             normalize_type='imagenet',
             random_seed=0,
@@ -115,7 +205,6 @@ class LazySupervisedDataset(Dataset):
         self.pad2square = pad2square
         self.max_num_frame = max_num_frame
         self.min_num_frame = min_num_frame
-        self.sampling_method = sampling_method
         self.normalize_type = normalize_type
 
         logger.info('Formatting inputs...Skip in lazy mode')
@@ -130,9 +219,14 @@ class LazySupervisedDataset(Dataset):
                 bar = tqdm.tqdm(f, desc=f'Loading {ds_name}', total=ds_meta['length'])
                 for line in f:
                     data = json.loads(line)
-                    for index, image in enumerate(data['images']):
-                        real_image_path = os.path.join(root, image)
-                        data['images'][index] = real_image_path
+                    if 'images' in data:
+                        for index, image in enumerate(data['images']):
+                            real_image_path = os.path.join(root, image)
+                            data['images'][index] = real_image_path
+                    if 'videos' in data:
+                        for index, video in enumerate(data['videos']):
+                            real_video_path = os.path.join(root, video)
+                            data['videos'][index] = real_video_path
                     target = data['conversations'][1]['value'].lower()
                     targets = [label.strip() for label in target.split(',')]
                     vocabs.extend(targets)
@@ -229,19 +323,53 @@ class LazySupervisedDataset(Dataset):
         transform = self.get_transform()
 
         images, num_tiles = [], []
-        num_image = len(data_item['images'])
-        for image_path in data_item['images']:
-            # Load the image using tcs_loader if available, otherwise use PIL
-            image = self.load_image(image_path)
-            if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
-                image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
-                                           max_num=self.max_dynamic_patch // num_image,
-                                           image_size=self.image_size, use_thumbnail=self.use_thumbnail)
-                images += image
-                num_tiles.append(len(image))
-            else:  # Otherwise, use the original image as a single patch
-                images.append(image)
-                num_tiles.append(1)
+        if 'images' in data_item:
+            num_image = len(data_item['images'])
+            for image_path in data_item['images']:
+                # Load the image using tcs_loader if available, otherwise use PIL
+                image = self.load_image(image_path)
+                if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+                    image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
+                                               max_num=self.max_dynamic_patch // num_image,
+                                               image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+                    images += image
+                    num_tiles.append(len(image))
+                else:  # Otherwise, use the original image as a single patch
+                    images.append(image)
+                    num_tiles.append(1)
+
+        if 'videos' in data_item:
+            for video_path in data_item['videos']:
+                try:
+                    # Sample frames from the video
+                    video_frames = sample_frames(
+                        video_path,
+                        num_frames=self.max_num_frame,
+                        is_train=self.is_train
+                    )
+
+                    if self.dynamic_image_size:
+                        for frame in video_frames:
+                            processed_frames = dynamic_preprocess(
+                                frame,
+                                min_num=self.min_dynamic_patch,
+                                max_num=self.max_dynamic_patch // len(video_frames),
+                                image_size=self.image_size,
+                                use_thumbnail=self.use_thumbnail
+                            )
+                            images += processed_frames
+                            num_tiles.append(len(processed_frames))
+                    else:
+                        images.extend(video_frames)
+                        num_tiles.extend([1] * len(video_frames))
+
+                except Exception as e:
+                    logger.error(f"Error processing video {video_path}: {e}")
+                    # Add black frames as fallback
+                    black_frames = [Image.new('RGB', (self.image_size, self.image_size), (0, 0, 0))] * 8
+                    images.extend(black_frames)
+                    num_tiles.extend([1] * 8)
+
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
 
@@ -364,9 +492,10 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}')
         for batch in dataloader:
             pixel_values = batch['pixel_values'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             datasets = batch['dataset']
-            outputs = model.forward_vision(pixel_values)
+            outputs = model.forward_vision(pixel_values, attention_mask)
             outputs = torch.sigmoid(outputs)
 
             for output, label, ds in zip(outputs, labels, datasets):
@@ -478,6 +607,8 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     # Load the model
     model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                               torch_dtype=torch.bfloat16)
+    if load_checkpoint is not None:
+        model.load_state_dict(torch.load(load_checkpoint))
     model.train()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -493,8 +624,6 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
                                              prefetch_factor=8)
 
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    auc_loss_fn = auc_losses.MultiLabelAUCMLoss(margin=auc_margin, version='v1', num_labels=vocab_size,
-                                                device=device, imratio=train_dataset.positive_ratio)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     if eval_only:
@@ -517,24 +646,22 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     for epoch in range(epochs):
         for batch in dataloader:
             pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
+            attention_mask = batch['attention_mask'].cuda()
             positive_values = batch['positive'].cuda().to(torch.bfloat16)
+            positive_attention_mask = batch['positive_attention_mask'].cuda()
             labels = batch['labels'].cuda().to(torch.bfloat16)
             negative_indices = batch['negative_indices'].cuda()
 
-            features = model.forward_vision(pixel_values, classify=False)
-            positive_outputs = model.forward_vision(positive_values, classify=False)
+            features = model.forward_vision(pixel_values, attention_mask=attention_mask, classify=False)
+            positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
+                                                    classify=False)
             outputs = model.classify(features)
 
-            classification_loss = loss_fn(outputs, labels)
+            classification_loss = loss_fn(outputs, labels) * 5
             contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
 
-            if step > 5050:
-                auc_loss = auc_loss_fn(outputs, labels)
-            else:
-                auc_loss = torch.tensor(0.0).to(device)
-
             # Backward pass
-            total_loss = classification_loss + contrastive_weight * contr_loss + auc_loss
+            total_loss = classification_loss + contrastive_weight * contr_loss
             total_loss.backward()
 
             # Gradient clipping
@@ -548,7 +675,6 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
                 'loss': total_loss.item(),
                 'classification_loss': classification_loss.item(),
                 'contrastive_loss': contr_loss.item(),
-                'auc_loss': auc_loss.item(),
                 'step': step,
                 'lr': lr,
                 'epoch': epoch
@@ -565,11 +691,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
                                     num_samples=8000)
             # save every 1000 steps
             if step % 1000 == 0:
-                model.save_pretrained(output_path)
+                torch.save(model.state_dict(), os.path.join(output_path, f'model_{step}.pt'))
             step += 1
 
     # Save the model via huggingface
-    model.save_pretrained(output_path)
+    torch.save(model.state_dict(), os.path.join(output_path, 'model.pt'))
 
 
 if __name__ == '__main__':
@@ -578,13 +704,16 @@ if __name__ == '__main__':
     arg_parser.add_argument('--output_path', type=str, required=True)
     arg_parser.add_argument('--lr', type=float, default=1e-5)
     arg_parser.add_argument('--wd', type=float, default=0)
-    arg_parser.add_argument('--bs', type=int, default=64)
+    arg_parser.add_argument('--bs', type=int, default=32)
     arg_parser.add_argument('--epochs', type=int, default=10)
     arg_parser.add_argument('--freeze_vision', action='store_true')
     arg_parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json')
     arg_parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_valid.json')
+    arg_parser.add_argument('--eval_only', action='store_true')
+    arg_parser.add_argument('--load_checkpoint', type=str, default=None)
 
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
                      lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
-                     meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path)
+                     meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path, eval_only=args.eval_only,
+                     load_checkpoint=args.load_checkpoint)
