@@ -249,22 +249,27 @@ class LazySupervisedDataset(Dataset):
             logger.info(f'Loaded vocab size: {len(vocabs)}')
             logger.info(f'Loaded vocab: {vocabs}')
         vocabs_to_index = {v: i for i, v in enumerate(vocabs)}
+        self.dataset_multilabel = []
+        all_labels = []
         for data in data_items:
             labels = [0] * len(vocabs)
+            if data['dataset'] not in self.dataset_multilabel and len(data['targets']) > 1:
+                self.dataset_multilabel.append(data['dataset'])
             for target in data['targets']:
                 if target in vocabs_to_index:
                     labels[vocabs_to_index[target]] = 1
                 else:
                     labels[-1] = 1  # unk
                     logger.warning(f'Unknown label: {target}')
+            all_labels.append(labels)
             data['labels'] = labels
         with open(vocab_path, 'w') as f:
             json.dump(vocabs, f)
 
-        # calculate positive ratio
-        agg_labels = torch.tensor([data['labels'] for data in data_items])
-        self.positive_ratio = agg_labels.sum(dim=0) / len(agg_labels)
-        self.positive_ratio = self.positive_ratio.cpu().tolist()
+        # calculate pos_weight
+        agg_labels = torch.tensor(all_labels, dtype=torch.float)
+        self.pos_weight = 1 / agg_labels.mean(dim=0).clamp(min=1e-6)
+        logger.info(f'pos_weight: {self.pos_weight}')
 
         self.data_items: List[Dict] = data_items
         self.vocabs = vocabs
@@ -284,7 +289,7 @@ class LazySupervisedDataset(Dataset):
     def build_vocab(self, vocab_path, vocabs):
         vocabs = list(set(vocabs))
         vocabs.sort()
-        vocabs.append('unknown')
+        # vocabs.append('unknown')
         with open(vocab_path, 'w') as f:
             json.dump(vocabs, f)
         return vocabs
@@ -474,19 +479,20 @@ def contrastive_loss(anchor, positive, negative_indices, temperature=0.07):
     return losses.mean()
 
 
-def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samples=-1):
+def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samples=-1, dataloader=None):
     model.eval()
     dataset_outputs = defaultdict(list)
     dataset_labels = defaultdict(list)
 
-    if len(dataset) > num_samples > 0:
-        subset_indices = random.sample(range(len(dataset)), num_samples)
-        subset = Subset(dataset, subset_indices)
-    else:
-        subset = dataset
+    if dataloader is None:
+        if len(dataset) > num_samples > 0:
+            subset_indices = random.sample(range(len(dataset)), num_samples)
+            subset = Subset(dataset, subset_indices)
+        else:
+            subset = dataset
 
-    dataloader = torch.utils.data.DataLoader(subset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
-                                             num_workers=32, pin_memory=True)
+        dataloader = torch.utils.data.DataLoader(subset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
+                                                 num_workers=32, pin_memory=True)
 
     with torch.no_grad():
         bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}')
@@ -496,10 +502,10 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             labels = batch['labels'].to(device)
             datasets = batch['dataset']
             outputs = model.forward_vision(pixel_values, attention_mask)
-            outputs = torch.sigmoid(outputs)
+            # outputs = torch.sigmoid(outputs)
 
             for output, label, ds in zip(outputs, labels, datasets):
-                dataset_outputs[ds].append(output.float().cpu().numpy())
+                dataset_outputs[ds].append(output.float().cpu())
                 dataset_labels[ds].append(label.float().cpu().numpy())
 
             bar.update(1)
@@ -513,12 +519,19 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
     }
 
     for ds in dataset_outputs.keys():
-        ds_outputs = np.stack(dataset_outputs[ds])
+        ds_outputs = torch.stack(dataset_outputs[ds])
         ds_labels = np.stack(dataset_labels[ds])
 
         valid_classes = np.where((ds_labels.sum(axis=0) > 0) & (ds_labels.sum(axis=0) < len(ds_labels)))[0]
         ds_outputs = ds_outputs[:, valid_classes]
         ds_labels = ds_labels[:, valid_classes]
+
+        if ds in dataset.dataset_multilabel:
+            # use sigmoid
+            ds_outputs = torch.sigmoid(ds_outputs).numpy()
+        else:
+            # use softmax
+            ds_outputs = torch.softmax(ds_outputs, dim=1).numpy()
 
         # Calculate metrics
         try:
@@ -585,7 +598,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
 
 
 def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False,
-                     max_grad_norm=2.0, contrastive_weight=0.5, auc_margin=4.0,
+                     max_grad_norm=2.0, contrastive_weight=0.5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
                      eval_only=False, load_checkpoint=None):
@@ -620,10 +633,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
 
     # Load the dataset
     dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=collate_fn,
-                                             num_workers=32, pin_memory=True, persistent_workers=True,
-                                             prefetch_factor=8)
+                                             num_workers=32, pin_memory=True)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
+                                                 num_workers=32, pin_memory=True)
 
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     if eval_only:
@@ -685,10 +699,13 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
             if step % 500 == 0 and step > 0:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000)
-                evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs, num_samples=-1)
+                evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
+                                    num_samples=-1, dataloader=val_dataloader)
             if step == 100:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000)
+                evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
+                                    num_samples=-1, dataloader=val_dataloader)
             # save every 1000 steps
             if step % 1000 == 0:
                 torch.save(model.state_dict(), os.path.join(output_path, f'model_{step}.pt'))
@@ -715,5 +732,6 @@ if __name__ == '__main__':
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
                      lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
-                     meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path, eval_only=args.eval_only,
+                     meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path,
+                     eval_only=args.eval_only,
                      load_checkpoint=args.load_checkpoint)
