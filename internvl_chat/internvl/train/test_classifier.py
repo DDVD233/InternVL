@@ -1,5 +1,6 @@
 import argparse
 import copy
+import sys
 from typing import Dict, List
 
 import cv2
@@ -131,6 +132,74 @@ def collate_fn(batch):
     return return_dict
 
 
+def build_dataset_label_indices(data_items, vocabs):
+    """Build a mapping of which labels appear in which datasets."""
+    dataset_label_indices = {}
+    dataset_label_counts = defaultdict(lambda: defaultdict(int))
+
+    # First pass: count label occurrences per dataset
+    for item in data_items:
+        dataset = item['dataset']
+        for target in item['targets']:
+            if target in vocabs:
+                label_idx = vocabs.index(target)
+                dataset_label_counts[dataset][label_idx] += 1
+
+    # Second pass: keep only labels that appear in each dataset
+    for dataset, label_counts in dataset_label_counts.items():
+        valid_indices = []
+        for label_idx, count in label_counts.items():
+            # You might want to adjust this threshold based on your needs
+            if count > 0:  # or use a higher threshold like count > 10
+                valid_indices.append(label_idx)
+        dataset_label_indices[dataset] = sorted(valid_indices)
+
+    return dataset_label_indices
+
+
+class DatasetSpecificBCELoss(nn.Module):
+    def __init__(self, dataset_label_indices, pos_weight=None):
+        super().__init__()
+        self.dataset_label_indices = dataset_label_indices
+        self.pos_weight = pos_weight
+        self.base_loss = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, predictions, targets, datasets):
+        """
+        Args:
+            predictions: (batch_size, num_classes) model predictions
+            targets: (batch_size, num_classes) target labels
+            datasets: list of dataset names for each sample
+        """
+        total_loss = 0
+        valid_samples = 0
+
+        for i, (pred, target, dataset) in enumerate(zip(predictions, targets, datasets)):
+            # Get valid indices for this dataset
+            valid_indices = self.dataset_label_indices[dataset]
+            if not valid_indices:
+                continue
+
+            # Select only valid predictions and targets
+            valid_pred = pred[valid_indices]
+            valid_target = target[valid_indices]
+
+            # Apply pos_weight if provided
+            if self.pos_weight is not None:
+                valid_pos_weight = self.pos_weight[valid_indices]
+                sample_loss = self.base_loss(valid_pred, valid_target) * valid_pos_weight
+            else:
+                sample_loss = self.base_loss(valid_pred, valid_target)
+
+            total_loss += sample_loss.mean()
+            valid_samples += 1
+
+        if valid_samples == 0:
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
+
+        return total_loss / valid_samples
+
+
 def sample_frames(video_path: str, num_frames: int, is_train: bool) -> List[Image.Image]:
     """
     Sample frames from a video file.
@@ -190,7 +259,7 @@ class LazySupervisedDataset(Dataset):
             min_dynamic_patch=1,
             max_dynamic_patch=8,
             min_num_frame=4,  # for video data
-            max_num_frame=8,  # for video data
+            # max_num_frame=8,  # for video data
             normalize_type='imagenet',
             random_seed=0,
             rebuild_vocab=False,
@@ -205,7 +274,7 @@ class LazySupervisedDataset(Dataset):
         self.image_size = image_size
         self.is_train = is_train
         self.pad2square = pad2square
-        self.max_num_frame = max_num_frame
+        self.max_num_frame = max_dynamic_patch
         self.min_num_frame = min_num_frame
         self.normalize_type = normalize_type
 
@@ -372,9 +441,10 @@ class LazySupervisedDataset(Dataset):
                 except Exception as e:
                     logger.error(f"Error processing video {video_path}: {e}")
                     # Add black frames as fallback
-                    black_frames = [Image.new('RGB', (self.image_size, self.image_size), (0, 0, 0))] * 8
+                    black_frames = [Image.new('RGB', (self.image_size, self.image_size),
+                                              (0, 0, 0))] * self.max_dynamic_patch
                     images.extend(black_frames)
-                    num_tiles.extend([1] * 8)
+                    num_tiles.extend([1] * self.max_dynamic_patch)
 
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
@@ -496,9 +566,13 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
                                                  num_workers=32, pin_memory=True)
 
     with torch.no_grad():
-        bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}')
-        for batch in dataloader:
-            pixel_values = batch['pixel_values'].to(device)
+        num_batches = len(dataloader)
+        if num_samples > 0:
+            num_batches = math.ceil(num_samples / bs)
+
+        bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}', total=num_batches)
+        for index, batch in enumerate(dataloader):
+            pixel_values = batch['pixel_values'].to(device).to(model.dtype)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             datasets = batch['dataset']
@@ -510,6 +584,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
                 dataset_labels[ds].append(label.float().cpu().numpy())
 
             bar.update(1)
+            if num_samples > 0 and index >= num_batches:
+                break
 
     overall_stats = {
         'auc': [],
@@ -518,6 +594,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         'specificity': [],
         'perfect_match': []
     }
+    by_modality_stats = defaultdict(lambda: defaultdict(list))
 
     for ds in dataset_outputs.keys():
         ds_outputs = torch.stack(dataset_outputs[ds])
@@ -565,11 +642,19 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             # Accumulate for overall statistics
             ds_length = len(ds_labels)
             if auc is not None:
-                overall_stats['auc'].extend([auc] * ds_length)
-            overall_stats['accuracy'].extend([accuracy] * ds_length)
-            overall_stats['sensitivity'].extend([sensitivity] * ds_length)
-            overall_stats['specificity'].extend([specificity] * ds_length)
-            overall_stats['perfect_match'].extend([perfect_match] * ds_length)
+                overall_stats['auc'].extend([auc])
+            overall_stats['accuracy'].extend([accuracy])
+            overall_stats['sensitivity'].extend([sensitivity])
+            overall_stats['specificity'].extend([specificity])
+            overall_stats['perfect_match'].extend([perfect_match])
+
+            # Accumulate for modality-specific statistics
+            modality = ds.split('_')[0]
+            by_modality_stats[modality]['auc'].append(auc)
+            by_modality_stats[modality]['accuracy'].append(accuracy)
+            by_modality_stats[modality]['sensitivity'].append(sensitivity)
+            by_modality_stats[modality]['specificity'].append(specificity)
+            by_modality_stats[modality]['perfect_match'].append(perfect_match)
         except ValueError:
             logger.error(f'Error calculating accuracy for {ds}')
             logger.error(f'Labels: {ds_labels}, predictions: {predictions}')
@@ -590,6 +675,20 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             'step': step,
             'epoch': epoch
         }
+
+        # Calculate and log modality-specific statistics
+        for modality, stats in by_modality_stats.items():
+            modality_auc = np.mean(stats['auc']) if stats['auc'] else None
+            modality_accuracy = np.mean(stats['accuracy'])
+            modality_sensitivity = np.mean(stats['sensitivity'])
+            modality_specificity = np.mean(stats['specificity'])
+
+            overall_stats[f'{split}/{modality}_auc'] = modality_auc
+            overall_stats[f'{split}/{modality}_accuracy'] = modality_accuracy
+            overall_stats[f'{split}/{modality}_sensitivity'] = modality_sensitivity
+            overall_stats[f'{split}/{modality}_specificity'] = modality_specificity
+            overall_stats[f'{split}/{modality}_perfect_match'] = np.mean(stats['perfect_match'])
+
         wandb.log(overall_stats)
         logger.info(f"Overall: {overall_stats}")
     except ValueError:
@@ -605,27 +704,45 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      eval_only=False, load_checkpoint=None):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    # Create and setup file handler
+    log_file = os.path.join(output_path, 'train.log')
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+
+    # Add both handlers to the logger
+    logger.addHandler(file_handler)
+
+    # Log all args passed into this function
+    logger.info(f'Arguments: {locals()}')
+
     wandb.init(project='high_modality')
+
     rebuild_vocab = True
     if load_checkpoint is not None:
         rebuild_vocab = False
     if 'internvl' in model_path.lower():
         dynamic_image_size = True
         image_size = 448
+        max_dynamic_patch = 8
     else:
         dynamic_image_size = False
         image_size = 224
+        max_dynamic_patch = 2
     train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
                                                      num_image_token=256, rebuild_vocab=rebuild_vocab,
                                                      is_train=True, dynamic_image_size=dynamic_image_size,
-                                                     image_size=image_size)
+                                                     image_size=image_size, max_dynamic_patch=max_dynamic_patch)
 
     train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256,
                                               output_path=output_path, dynamic_image_size=dynamic_image_size,
-                                              is_train=False, image_size=image_size)
+                                              is_train=False, image_size=image_size,
+                                              max_dynamic_patch=max_dynamic_patch)
     val_dataset = LazySupervisedDataset(meta_valid_path, num_image_token=256,
                                         output_path=output_path, dynamic_image_size=dynamic_image_size,
-                                        is_train=False, image_size=image_size)
+                                        is_train=False, image_size=image_size, max_dynamic_patch=max_dynamic_patch)
     vocab_size = len(train_dataset.vocabs)
 
     # Load the model
@@ -633,7 +750,8 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         model = ConvNextV2Classifier.from_pretrained(
             model_path,  # or any other ConvNeXtV2 checkpoint
             vision_output_size=vocab_size
-        )
+        ).cuda()
+        model = model.to(torch.bfloat16)
     else:
         model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                                   torch_dtype=torch.bfloat16)
@@ -663,12 +781,26 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                                              num_workers=32, pin_memory=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
                                                  num_workers=32, pin_memory=True)
+    train_val_loader = torch.utils.data.DataLoader(train_val_dataset, batch_size=bs, shuffle=True,
+                                                   collate_fn=collate_fn,
+                                                   num_workers=32, pin_memory=True)
 
     # Calculate total steps for the scheduler
     total_steps = len(dataloader) * epochs
-    warmup_steps = total_steps // 10  # 1/10 of total steps for warmup
+    warmup_steps = total_steps // 15  # 1/15 of total steps for warmup
 
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
+    dataset_label_indices = build_dataset_label_indices(train_dataset.data_items, train_dataset.vocabs)
+
+    # Add dataset_label_indices to the dataset object
+    train_dataset.dataset_label_indices = dataset_label_indices
+
+    # Initialize the dataset-specific loss function
+    loss_fn = DatasetSpecificBCELoss(
+        dataset_label_indices=dataset_label_indices,
+        pos_weight=train_dataset.pos_weight.cuda()
+    )
+
+    # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     # Initialize the learning rate scheduler
@@ -704,13 +836,14 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             positive_attention_mask = batch['positive_attention_mask'].cuda()
             labels = batch['labels'].cuda().to(model.dtype)
             negative_indices = batch['negative_indices'].cuda()
+            datasets = batch['dataset']
 
             features = model.forward_vision(pixel_values, attention_mask=attention_mask, classify=False)
             positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
                                                     classify=False)
             outputs = model.classify(features)
 
-            classification_loss = loss_fn(outputs, labels) * 5
+            classification_loss = loss_fn(outputs, labels, datasets)
             contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
 
             # Backward pass
@@ -739,14 +872,14 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                 logger.info(f'Step {step}: {stats}')
             if step % 500 == 0 and step > 0:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
-                                    num_samples=8000)
+                                    num_samples=8000, dataloader=train_val_loader)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
                                     num_samples=-1, dataloader=val_dataloader)
-            if step == 100:
-                evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
-                                    num_samples=8000)
-                evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
-                                    num_samples=-1, dataloader=val_dataloader)
+            # if step == 100:
+            #     evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
+            #                         num_samples=8000, dataloader=train_val_loader)
+            #     evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
+            #                         num_samples=-1, dataloader=val_dataloader)
             # save every 1000 steps
             if step % 1000 == 0:
                 torch.save(model.state_dict(), os.path.join(output_path, f'model_{step}.pt'))
@@ -761,9 +894,9 @@ if __name__ == '__main__':
     arg_parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL2-8B')
     arg_parser.add_argument('--output_path', type=str, required=True)
     arg_parser.add_argument('--lr', type=float, default=1e-5)
-    arg_parser.add_argument('--wd', type=float, default=0)
+    arg_parser.add_argument('--wd', type=float, default=0.005)
     arg_parser.add_argument('--bs', type=int, default=32)
-    arg_parser.add_argument('--epochs', type=int, default=10)
+    arg_parser.add_argument('--epochs', type=int, default=3)
     arg_parser.add_argument('--freeze_vision', action='store_true')
     arg_parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json')
     arg_parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_valid.json')
