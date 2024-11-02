@@ -29,6 +29,8 @@ import wandb
 import logging
 import torch.nn.functional as F
 import libauc.losses as auc_losses
+from internvl.model.convnext import ConvNextV2Classifier
+from transformers import get_cosine_schedule_with_warmup
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -178,6 +180,7 @@ class LazySupervisedDataset(Dataset):
             self,
             meta_path,
             num_image_token,
+            output_path,
             image_size=448,
             is_train=False,
             pad2square=False,
@@ -188,10 +191,9 @@ class LazySupervisedDataset(Dataset):
             max_dynamic_patch=8,
             min_num_frame=4,  # for video data
             max_num_frame=8,  # for video data
-            sampling_method='rand',  # for video data
             normalize_type='imagenet',
             random_seed=0,
-            rebuild_vocab=False
+            rebuild_vocab=False,
     ):
         super(LazySupervisedDataset, self).__init__()
         self.num_image_token = num_image_token
@@ -235,9 +237,8 @@ class LazySupervisedDataset(Dataset):
                     data_items.append(data)
                     bar.update(1)
 
-        meta_name = os.path.basename(meta_path).replace('.json', '').replace('_train', '').replace('_valid', '')
-
-        vocab_path = os.path.join(os.path.dirname(meta_path), f'{meta_name}_vocabs.json')
+        # meta_name = os.path.basename(meta_path).replace('.json', '').replace('_train', '').replace('_valid', '')
+        vocab_path = os.path.join(output_path, f'vocabs.json')
         if not os.path.exists(vocab_path) or rebuild_vocab:
             logger.info('Building vocab...')
             vocabs = self.build_vocab(vocab_path, vocabs)
@@ -597,7 +598,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
     model.train()
 
 
-def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10, freeze_vision=False,
+def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5, freeze_vision=False,
                      max_grad_norm=2.0, contrastive_weight=0.5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
@@ -605,23 +606,49 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     wandb.init(project='high_modality')
-    train_dataset = ContrastiveLazySupervisedDataset(meta_train_path,
-                                                     num_image_token=256, rebuild_vocab=True, is_train=True)
-    # sampler = DualSampler(train_dataset, batch_size=bs, sampling_rate=sampling_rate, shuffle=True)
+    rebuild_vocab = True
+    if load_checkpoint is not None:
+        rebuild_vocab = False
+    if 'internvl' in model_path.lower():
+        dynamic_image_size = True
+        image_size = 448
+    else:
+        dynamic_image_size = False
+        image_size = 224
+    train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
+                                                     num_image_token=256, rebuild_vocab=rebuild_vocab,
+                                                     is_train=True, dynamic_image_size=dynamic_image_size,
+                                                     image_size=image_size)
 
-    train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256)
-    val_dataset = LazySupervisedDataset(meta_valid_path, num_image_token=256)
-    # train_dataset.save_annotation(meta_train_path,
-    #                               rel_path='/home/dvd/Datasets/high_modality/')
-    # val_dataset.save_annotation(meta_valid_path,
-    #                             rel_path='/home/dvd/Datasets/high_modality/')
+    train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256,
+                                              output_path=output_path, dynamic_image_size=dynamic_image_size,
+                                              is_train=False, image_size=image_size)
+    val_dataset = LazySupervisedDataset(meta_valid_path, num_image_token=256,
+                                        output_path=output_path, dynamic_image_size=dynamic_image_size,
+                                        is_train=False, image_size=image_size)
     vocab_size = len(train_dataset.vocabs)
 
     # Load the model
-    model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
-                                              torch_dtype=torch.bfloat16)
+    if 'convnext' in model_path.lower():
+        model = ConvNextV2Classifier.from_pretrained(
+            model_path,  # or any other ConvNeXtV2 checkpoint
+            vision_output_size=vocab_size
+        )
+    else:
+        model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
+                                                  torch_dtype=torch.bfloat16)
     if load_checkpoint is not None:
-        model.load_state_dict(torch.load(load_checkpoint))
+        checkpoint = torch.load(load_checkpoint)
+        if 'model' in checkpoint and 'encoder.embeddings.position_embedding' in checkpoint['model']:
+            # This is loaded from pretrain, process the keys
+            new_checkpoint = {}
+            for key, value in checkpoint['model'].items():
+                if 'encoder' in key:
+                    new_key: str = key.replace('encoder.', 'vision_model.', 1)
+                    new_checkpoint[new_key] = value
+            checkpoint = new_checkpoint
+        model.load_state_dict(checkpoint, strict=False)
+        print(f'Loaded checkpoint from {load_checkpoint}')
     model.train()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -637,8 +664,19 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
                                                  num_workers=32, pin_memory=True)
 
+    # Calculate total steps for the scheduler
+    total_steps = len(dataloader) * epochs
+    warmup_steps = total_steps // 10  # 1/10 of total steps for warmup
+
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+
+    # Initialize the learning rate scheduler
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
 
     if eval_only:
         evaluate_classifier(model, train_val_dataset, device, 'train', bs=bs, step=0, epoch=0, num_samples=8000)
@@ -648,6 +686,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f'Trainable parameters: {trainable_params}')
+    logger.info(f'Total steps: {total_steps}, Warmup steps: {warmup_steps}')
 
     # save vocab to output path
     meta_train_name = os.path.basename(meta_train_path)
@@ -659,11 +698,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
     step = 0
     for epoch in range(epochs):
         for batch in dataloader:
-            pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
+            pixel_values = batch['pixel_values'].cuda().to(model.dtype)
             attention_mask = batch['attention_mask'].cuda()
-            positive_values = batch['positive'].cuda().to(torch.bfloat16)
+            positive_values = batch['positive'].cuda().to(model.dtype)
             positive_attention_mask = batch['positive_attention_mask'].cuda()
-            labels = batch['labels'].cuda().to(torch.bfloat16)
+            labels = batch['labels'].cuda().to(model.dtype)
             negative_indices = batch['negative_indices'].cuda()
 
             features = model.forward_vision(pixel_values, attention_mask=attention_mask, classify=False)
@@ -683,14 +722,16 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=10
 
             # Optimizer step
             optimizer.step()
+            scheduler.step()  # Update learning rate
             optimizer.zero_grad()
 
+            current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
             stats = {
                 'loss': total_loss.item(),
                 'classification_loss': classification_loss.item(),
                 'contrastive_loss': contr_loss.item(),
                 'step': step,
-                'lr': lr,
+                'lr': current_lr,  # Log current learning rate
                 'epoch': epoch
             }
             wandb.log(stats)
