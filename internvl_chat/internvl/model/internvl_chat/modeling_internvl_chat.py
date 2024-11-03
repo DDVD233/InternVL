@@ -3,6 +3,7 @@
 # Copyright (c) 2024 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+import os
 import warnings
 from typing import Any, List, Optional, Tuple, Union
 
@@ -24,6 +25,10 @@ from transformers.utils import ModelOutput, logging
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
 
+from functools import partial
+from torch.nn import functional as F
+from timm.models.layers import DropPath
+
 logger = logging.get_logger(__name__)
 
 
@@ -33,6 +38,105 @@ def version_cmp(v1, v2, op='eq'):
     from packaging import version
     op_func = getattr(operator, op)
     return op_func(version.parse(v1), version.parse(v2))
+
+
+class CrossAttention(nn.Module):
+    def __init__(
+            self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
+            proj_drop=0., attn_head_dim=None, out_dim=None):
+        super().__init__()
+        if out_dim is None:
+            out_dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        if attn_head_dim is not None:
+            head_dim = attn_head_dim
+        all_head_dim = head_dim * self.num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        assert all_head_dim == dim
+
+        self.q = nn.Linear(dim, all_head_dim, bias=False)
+        self.k = nn.Linear(dim, all_head_dim, bias=False)
+        self.v = nn.Linear(dim, all_head_dim, bias=False)
+
+        if qkv_bias:
+            self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
+            self.k_bias = nn.Parameter(torch.zeros(all_head_dim))
+            self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
+        else:
+            self.q_bias = None
+            self.k_bias = None
+            self.v_bias = None
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(all_head_dim, out_dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, k=None, v=None):
+        B, N, C = x.shape
+        N_k = k.shape[1]
+        N_v = v.shape[1]
+
+        q_bias, k_bias, v_bias = None, None, None
+        if self.q_bias is not None:
+            q_bias = self.q_bias
+            k_bias = self.k_bias
+            v_bias = self.v_bias
+
+        q = F.linear(input=x, weight=self.q.weight, bias=q_bias)
+        q = q.reshape(B, N, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)  # (B, N_head, N_q, dim)
+
+        k = F.linear(input=k, weight=self.k.weight, bias=k_bias)
+        k = k.reshape(B, N_k, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)
+
+        v = F.linear(input=v, weight=self.v.weight, bias=v_bias)
+        v = v.reshape(B, N_v, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))  # (B, N_head, N_q, N_k)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+class AttentiveBlock(nn.Module):
+
+    def __init__(self, dim, num_heads, qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., norm_layer=nn.LayerNorm, attn_head_dim=None, out_dim=None):
+        super().__init__()
+
+        self.norm1_q = norm_layer(dim)
+        self.norm1_k = norm_layer(dim)
+        self.norm1_v = norm_layer(dim)
+        self.cross_attn = CrossAttention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop,
+            proj_drop=drop, attn_head_dim=attn_head_dim, out_dim=out_dim)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x_q, x_kv, pos_q, pos_k, bool_masked_pos, rel_pos_bias=None):
+        x_q = self.norm1_q(x_q + pos_q)
+        x_k = self.norm1_k(x_kv + pos_k)
+        x_v = self.norm1_v(x_kv)
+        x = self.cross_attn(x_q, k=x_k, v=x_v)
+
+        return x
+
+
+class AttentionPoolingBlock(AttentiveBlock):
+
+    def forward(self, x):
+        x_q = x.mean(1, keepdim=True)
+        x_kv, pos_q, pos_k = x, 0, 0
+        x = super().forward(x_q, x_kv, pos_q, pos_k, bool_masked_pos=None, rel_pos_bias=None)
+        x = x.squeeze(1)
+        return x
 
 
 class InternVLChatModel(PreTrainedModel):
@@ -91,7 +195,20 @@ class InternVLChatModel(PreTrainedModel):
         if vision_only:
             self.language_model = None
             self.mlp1 = None
-            self.fc = nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio) ** 2 * self.num_image_token, vision_output_size)
+
+            self.clip_projector = AttentionPoolingBlock(
+                dim=vit_hidden_size,
+                num_heads=8,  # Can be configured in config
+                qkv_bias=True,
+                qk_scale=None,
+                drop=0.,
+                attn_drop=0.,
+                norm_layer=partial(nn.LayerNorm, eps=1e-5),
+                out_dim=512
+            )
+
+            self.fc = nn.Linear(512, vision_output_size)
+
             # init_weights
             for m in self.fc.modules():
                 if isinstance(m, nn.Linear):
@@ -111,6 +228,18 @@ class InternVLChatModel(PreTrainedModel):
 
         if config.use_llm_lora:
             self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], *model_args, **kwargs):
+        # First load the model normally
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+
+        # After loading pre-trained weights, initialize our new components
+        model._init_attention_pool()
+        nn.init.trunc_normal_(model.fc.weight, std=0.02)
+        nn.init.constant_(model.fc.bias, 0)
+
+        return model
 
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
@@ -144,30 +273,56 @@ class InternVLChatModel(PreTrainedModel):
         self.language_model.enable_input_require_grads()
         self.language_model.print_trainable_parameters()
 
+    def _init_attention_pool(self):
+        """Initialize the attention pooling parameters."""
+        # Initialize query tokens
+        for name, param in self.clip_projector.named_parameters():
+            if 'q' in name:
+                nn.init.trunc_normal_(param, std=0.02)
+            elif 'k' in name or 'v' in name:
+                nn.init.trunc_normal_(param, std=0.02)
+            elif 'proj' in name:
+                nn.init.trunc_normal_(param, std=0.02)
+                if 'bias' in name:
+                    nn.init.constant_(param, 0)
+            elif 'norm' in name:
+                if 'weight' in name:
+                    nn.init.constant_(param, 1.0)
+                elif 'bias' in name:
+                    nn.init.constant_(param, 0)
+
     def forward_vision(self, pixel_values, attention_mask=None, classify=True):
         assert self.vision_only, "This method is only available in vision_only mode."
         b, n, c, h, w = pixel_values.shape
         pixel_values = pixel_values.view(b * n, c, h, w)
         pixel_values = pixel_values.to(self.vision_model.dtype)
-        features = self.extract_feature(pixel_values)
+        features = self.vision_model(
+                pixel_values=pixel_values,
+                output_hidden_states=False,
+                return_dict=True).last_hidden_state[:, 1:, :]
         b_n, np, c = features.shape
-        features = features.view(b, n, np * c)
+        features = features.view(b, n, np, c)
+
         if attention_mask is not None:
-            # Expand attention mask to match feature dimensions
-            attention_mask = attention_mask.to(features.dtype)  # Convert to same dtype as features
-            mask = attention_mask.unsqueeze(-1)  # Shape: (b, n, 1)
+            # Apply attention mask
+            attention_mask = attention_mask.to(features.dtype)
+            mask = attention_mask.unsqueeze(-1).unsqueeze(-1)  # Shape: (b, n, 1, 1)
+            features = features * mask
 
-            # Apply mask
-            features = features * mask  # Shape: (b, n, np*c)
+        # Apply attention pooling across frames
+        pooled_features = []
+        for i in range(b):
+            if attention_mask is not None:
+                # Convert to int and move to CPU for indexing
+                valid_length = int(attention_mask[i].sum().item())
+                frame_features = features[i, :valid_length]  # Only use valid frames
+            else:
+                frame_features = features[i]  # Use all frames if no mask
+            pooled = self.clip_projector(frame_features)  # Shape: (n, clip_embed_dim)
+            pooled = pooled.mean(0)  # Shape: (clip_embed_dim,)
+            pooled_features.append(pooled)
 
-            # Mean pooling over non-padded frames only
-            # Sum features and divide by number of real frames (sum of mask)
-            features_sum = features.sum(dim=1)  # Shape: (b, np*c)
-            mask_sum = mask.sum(dim=1).clamp(min=1.0)  # Shape: (b, 1), clamp to avoid division by zero
-            features = features_sum / mask_sum  # Shape: (b, np*c)
-        else:
-            # Original mean pooling if no mask provided
-            features = features.mean(dim=1)  # Shape: (b, np*c)
+        features = torch.stack(pooled_features)
 
         if classify:
             return self.classify(features)
@@ -204,7 +359,8 @@ class InternVLChatModel(PreTrainedModel):
         input_embeds = input_embeds.reshape(B * N, C)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
+            print(
+                f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
 
         input_ids = input_ids.reshape(B * N)
         selected = (input_ids == self.img_context_token_id)
@@ -293,8 +449,8 @@ class InternVLChatModel(PreTrainedModel):
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        if not self.vision_only:
-            vit_embeds = self.mlp1(vit_embeds)
+        # if not self.vision_only:
+        #     vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
     def batch_chat(self, tokenizer, pixel_values, questions, generation_config, num_patches_list=None,

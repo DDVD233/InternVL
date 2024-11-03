@@ -13,9 +13,7 @@ import json
 import math
 import os
 import warnings
-from internvl.train.dataset import (ConcatDataset, TCSLoader,
-                                    WeightedConcatDataset, build_transform,
-                                    dynamic_preprocess)
+from internvl.train.dataset import build_transform, dynamic_preprocess
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -23,13 +21,12 @@ import numpy as np
 import torch
 from torch.utils.data import Subset
 import random
-from sklearn.metrics import roc_auc_score, hamming_loss, confusion_matrix
+from sklearn.metrics import roc_auc_score, hamming_loss, confusion_matrix, f1_score
 from collections import defaultdict
 import tqdm
 import wandb
 import logging
 import torch.nn.functional as F
-import libauc.losses as auc_losses
 from internvl.model.convnext import ConvNextV2Classifier
 from transformers import get_cosine_schedule_with_warmup
 
@@ -550,6 +547,43 @@ def contrastive_loss(anchor, positive, negative_indices, temperature=0.07):
     return losses.mean()
 
 
+def calculate_multilabel_metrics(y_true, y_pred, threshold=0.5):
+    """
+    Calculate sensitivity (recall) and specificity for multilabel classification.
+
+    Parameters:
+    y_true: numpy array of shape (n_samples, n_classes) with true binary labels
+    y_pred: numpy array of shape (n_samples, n_classes) with predicted probabilities
+    threshold: float, classification threshold (default 0.5)
+
+    Returns:
+    dict containing per-class and macro-averaged metrics
+    """
+    n_classes = y_true.shape[1]
+
+    # Convert probabilities to binary predictions
+    y_pred_binary = (y_pred >= threshold).astype(int)
+
+    # Initialize metrics storage
+    sensitivities = []
+    specificities = []
+
+    # Calculate metrics for each class
+    for i in range(n_classes):
+        tn, fp, fn, tp = confusion_matrix(y_true[:, i], y_pred_binary[:, i]).ravel()
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        sensitivities.append(sensitivity)
+        specificities.append(specificity)
+
+    # Calculate macro-averaged metrics
+    sensitivity = np.mean(sensitivities)
+    specificity = np.mean(specificities)
+
+    return sensitivity, specificity
+
+
 def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samples=-1, dataloader=None):
     model.eval()
     dataset_outputs = defaultdict(list)
@@ -592,7 +626,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         'accuracy': [],
         'sensitivity': [],
         'specificity': [],
-        'perfect_match': []
+        'perfect_match': [],
+        'f1': []
     }
     by_modality_stats = defaultdict(lambda: defaultdict(list))
 
@@ -601,63 +636,81 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         ds_labels = np.stack(dataset_labels[ds])
 
         valid_classes = np.where((ds_labels.sum(axis=0) > 0) & (ds_labels.sum(axis=0) < len(ds_labels)))[0]
+
+        # If no valid class
+        if len(valid_classes) == 0:
+            logger.warning(f"No valid classes found for dataset {ds}")
+            continue
+
         ds_outputs = ds_outputs[:, valid_classes]
         ds_labels = ds_labels[:, valid_classes]
 
-        if ds in dataset.dataset_multilabel:
+        if ds in dataset.dataset_multilabel:  # This is multilabel
             # use sigmoid
             ds_outputs = torch.sigmoid(ds_outputs).numpy()
-        else:
-            # use softmax
-            ds_outputs = torch.softmax(ds_outputs, dim=1).numpy()
 
-        # Calculate metrics
-        try:
-            auc = roc_auc_score(ds_labels, ds_outputs, average='macro')
-        except ValueError:
-            auc = None
+            # Convert outputs to binary predictions
+            predictions = (ds_outputs > 0.5).astype(int)
+            zero_pred_samples = (predictions.sum(axis=1) == 0)
+            if any(zero_pred_samples):
+                # Get indices of highest probability for each sample
+                highest_prob_indices = predictions[zero_pred_samples].argmax(axis=1)
 
-        # Convert outputs to binary predictions
-        predictions = (ds_outputs > 0.5).astype(int)
-        try:
+                # Use advanced indexing to set the highest probability class to 1
+                sample_indices = np.where(zero_pred_samples)[0]
+                predictions[sample_indices, highest_prob_indices] = 1
+
             accuracy = 1 - hamming_loss(ds_labels, predictions)
             # also calculate perfect match accuracy
             perfect_match = (ds_labels == predictions).all(axis=1).mean()
-            # Calculate sensitivity and specificity
-            cm = confusion_matrix(ds_labels.ravel(), predictions.ravel())
-            sensitivity = cm[1, 1] / (cm[1, 1] + cm[1, 0])
-            specificity = cm[0, 0] / (cm[0, 0] + cm[0, 1])
 
-            # Log dataset-specific metrics to wandb
-            stats = {
-                f'{ds}/{split}/auc': auc,
-                f'{ds}/{split}/accuracy': accuracy,
-                f'{ds}/{split}/sensitivity': sensitivity,
-                f'{ds}/{split}/specificity': specificity,
-                f'{ds}/{split}/perfect_match': perfect_match,
-            }
-            wandb.log(stats)
-            logger.info(f"Dataset {ds}: {stats}")
+        else:  # This is multiclass
+            # use softmax
+            ds_outputs = torch.softmax(ds_outputs, dim=1).numpy()
+            predictions = np.zeros_like(ds_outputs)
+            predictions[np.arange(len(ds_outputs)), ds_outputs.argmax(1)] = 1
 
-            # Accumulate for overall statistics
-            ds_length = len(ds_labels)
-            if auc is not None:
-                overall_stats['auc'].extend([auc])
-            overall_stats['accuracy'].extend([accuracy])
-            overall_stats['sensitivity'].extend([sensitivity])
-            overall_stats['specificity'].extend([specificity])
-            overall_stats['perfect_match'].extend([perfect_match])
+            perfect_match = accuracy = (predictions == ds_labels).mean()
 
-            # Accumulate for modality-specific statistics
-            modality = ds.split('_')[0]
-            by_modality_stats[modality]['auc'].append(auc)
-            by_modality_stats[modality]['accuracy'].append(accuracy)
-            by_modality_stats[modality]['sensitivity'].append(sensitivity)
-            by_modality_stats[modality]['specificity'].append(specificity)
-            by_modality_stats[modality]['perfect_match'].append(perfect_match)
+
+        try:
+            auc = roc_auc_score(ds_labels, ds_outputs, average='weighted')
         except ValueError:
-            logger.error(f'Error calculating accuracy for {ds}')
-            logger.error(f'Labels: {ds_labels}, predictions: {predictions}')
+            auc = None
+
+        sensitivity, specificity = calculate_multilabel_metrics(ds_labels, predictions)
+        f1_scores = f1_score(ds_labels, predictions, average='weighted')
+
+        # Log dataset-specific metrics to wandb
+        stats = {
+            f'{ds}/{split}/auc': auc,
+            f'{ds}/{split}/accuracy': accuracy,
+            f'{ds}/{split}/sensitivity': sensitivity,
+            f'{ds}/{split}/specificity': specificity,
+            f'{ds}/{split}/perfect_match': perfect_match,
+            f'{ds}/{split}/f1': f1_scores,
+            'step': step,
+        }
+        wandb.log(stats)
+        logger.info(f"Dataset {ds}: {stats}")
+
+        # Accumulate for overall statistics
+        if auc is not None:
+            overall_stats['auc'].extend([auc])
+        overall_stats['accuracy'].extend([accuracy])
+        overall_stats['sensitivity'].extend([sensitivity])
+        overall_stats['specificity'].extend([specificity])
+        overall_stats['perfect_match'].extend([perfect_match])
+        overall_stats['f1'].extend([f1_scores])
+
+        # Accumulate for modality-specific statistics
+        modality = ds.split('_')[0]
+        by_modality_stats[modality]['auc'].append(auc)
+        by_modality_stats[modality]['accuracy'].append(accuracy)
+        by_modality_stats[modality]['sensitivity'].append(sensitivity)
+        by_modality_stats[modality]['specificity'].append(specificity)
+        by_modality_stats[modality]['perfect_match'].append(perfect_match)
+        by_modality_stats[modality]['f1'].append(f1_scores)
 
     try:
         # Calculate and log overall statistics
@@ -665,6 +718,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         overall_accuracy = np.mean(overall_stats['accuracy'])
         overall_sensitivity = np.mean(overall_stats['sensitivity'])
         overall_specificity = np.mean(overall_stats['specificity'])
+        overall_f1 = np.mean(overall_stats['f1'])
 
         overall_stats = {
             f'{split}/overall_auc': overall_auc,
@@ -672,6 +726,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             f'{split}/overall_sensitivity': overall_sensitivity,
             f'{split}/overall_specificity': overall_specificity,
             f'{split}/overall_perfect_match': np.mean(overall_stats['perfect_match']),
+            f'{split}/overall_f1': overall_f1,
             'step': step,
             'epoch': epoch
         }
@@ -688,6 +743,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             overall_stats[f'{split}/{modality}_sensitivity'] = modality_sensitivity
             overall_stats[f'{split}/{modality}_specificity'] = modality_specificity
             overall_stats[f'{split}/{modality}_perfect_match'] = np.mean(stats['perfect_match'])
+            overall_stats[f'{split}/{modality}_f1'] = np.mean(stats['f1'])
 
         wandb.log(overall_stats)
         logger.info(f"Overall: {overall_stats}")
@@ -724,24 +780,24 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     if load_checkpoint is not None:
         rebuild_vocab = False
     if 'internvl' in model_path.lower():
-        dynamic_image_size = True
+        # dynamic_image_size = True
         image_size = 448
         max_dynamic_patch = 8
     else:
-        dynamic_image_size = False
+        # dynamic_image_size = False
         image_size = 224
         max_dynamic_patch = 2
     train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
                                                      num_image_token=256, rebuild_vocab=rebuild_vocab,
-                                                     is_train=True, dynamic_image_size=dynamic_image_size,
+                                                     is_train=True, dynamic_image_size=False,
                                                      image_size=image_size, max_dynamic_patch=max_dynamic_patch)
 
     train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256,
-                                              output_path=output_path, dynamic_image_size=dynamic_image_size,
+                                              output_path=output_path, dynamic_image_size=False,
                                               is_train=False, image_size=image_size,
                                               max_dynamic_patch=max_dynamic_patch)
     val_dataset = LazySupervisedDataset(meta_valid_path, num_image_token=256,
-                                        output_path=output_path, dynamic_image_size=dynamic_image_size,
+                                        output_path=output_path, dynamic_image_size=False,
                                         is_train=False, image_size=image_size, max_dynamic_patch=max_dynamic_patch)
     vocab_size = len(train_dataset.vocabs)
 
@@ -787,7 +843,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Calculate total steps for the scheduler
     total_steps = len(dataloader) * epochs
-    warmup_steps = total_steps // 15  # 1/15 of total steps for warmup
+    warmup_steps = 500  # 1/30 of total steps for warmup
 
     dataset_label_indices = build_dataset_label_indices(train_dataset.data_items, train_dataset.vocabs)
 
@@ -796,8 +852,8 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Initialize the dataset-specific loss function
     loss_fn = DatasetSpecificBCELoss(
-        dataset_label_indices=dataset_label_indices,
-        pos_weight=train_dataset.pos_weight.cuda()
+        dataset_label_indices=dataset_label_indices
+        # pos_weight=train_dataset.pos_weight.cuda()
     )
 
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
@@ -893,7 +949,7 @@ if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL2-8B')
     arg_parser.add_argument('--output_path', type=str, required=True)
-    arg_parser.add_argument('--lr', type=float, default=1e-5)
+    arg_parser.add_argument('--lr', type=float, default=1.5e-5)
     arg_parser.add_argument('--wd', type=float, default=0.005)
     arg_parser.add_argument('--bs', type=int, default=32)
     arg_parser.add_argument('--epochs', type=int, default=3)
