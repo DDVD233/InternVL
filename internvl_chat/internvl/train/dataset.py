@@ -297,22 +297,22 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type='imag
             T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             T.RandomHorizontalFlip(p=0.5),
             # T.RandomVerticalFlip(p=0.5),
-            T.RandomRotation(degrees=10),
+            # T.RandomRotation(degrees=10),
             T.RandomApply([
                 T.ColorJitter(brightness=0.2, contrast=0.2)
-            ], p=0.2),
+            ], p=0.5),
             T.RandomAdjustSharpness(sharpness_factor=2, p=0.2),
             T.RandomApply([
                 T.ColorJitter(hue=0.1, saturation=0.2)
-            ], p=0.1),
-            T.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1),
+            ], p=0.3),
+            T.RandomAffine(degrees=(10, 30), translate=(0.1, 0.1), scale=(0.9, 1.1),
                            interpolation=InterpolationMode.BILINEAR),
             T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
             T.ToTensor(),
             T.Normalize(mean=MEAN, std=STD),
             T.RandomApply([
                 T.ElasticTransform(alpha=50.0, sigma=5.0)
-            ], p=0.2),
+            ], p=0.1),
             T.RandomErasing(p=0.1, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0)
         ])
     else:
