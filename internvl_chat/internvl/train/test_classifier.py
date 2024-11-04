@@ -7,6 +7,7 @@ import cv2
 import wandb
 from torch import nn
 
+from internvl.model.eva_classifier import EVA02Classifier
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 import gc
 import json
@@ -28,7 +29,9 @@ import wandb
 import logging
 import torch.nn.functional as F
 from internvl.model.convnext import ConvNextV2Classifier
+from internvl.model.sbb_vit import ViTSBBClassifier
 from transformers import get_cosine_schedule_with_warmup
+from internvl.model.clip import OpenCLIPClassifier
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -154,12 +157,14 @@ def build_dataset_label_indices(data_items, vocabs):
     return dataset_label_indices
 
 
-class DatasetSpecificBCELoss(nn.Module):
-    def __init__(self, dataset_label_indices, pos_weight=None):
+class MixedClassificationLoss(nn.Module):
+    def __init__(self, dataset_label_indices, multilabel_datasets, pos_weight=None):
         super().__init__()
         self.dataset_label_indices = dataset_label_indices
+        self.multilabel_datasets = multilabel_datasets
         self.pos_weight = pos_weight
-        self.base_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
 
     def forward(self, predictions, targets, datasets):
         """
@@ -169,27 +174,56 @@ class DatasetSpecificBCELoss(nn.Module):
             datasets: list of dataset names for each sample
         """
         total_loss = 0
+        batch_size = len(datasets)
         valid_samples = 0
 
-        for i, (pred, target, dataset) in enumerate(zip(predictions, targets, datasets)):
-            # Get valid indices for this dataset
-            valid_indices = self.dataset_label_indices[dataset]
-            if not valid_indices:
-                continue
+        # Group samples by dataset type
+        multilabel_mask = torch.tensor([d in self.multilabel_datasets for d in datasets],
+                                       device=predictions.device)
 
-            # Select only valid predictions and targets
-            valid_pred = pred[valid_indices]
-            valid_target = target[valid_indices]
+        if multilabel_mask.any():
+            # Handle multi-label samples
+            ml_preds = predictions[multilabel_mask]
+            ml_targets = targets[multilabel_mask]
+            ml_datasets = [d for i, d in enumerate(datasets) if multilabel_mask[i]]
 
-            # Apply pos_weight if provided
-            if self.pos_weight is not None:
-                valid_pos_weight = self.pos_weight[valid_indices]
-                sample_loss = self.base_loss(valid_pred, valid_target) * valid_pos_weight
-            else:
-                sample_loss = self.base_loss(valid_pred, valid_target)
+            for i, (pred, target, dataset) in enumerate(zip(ml_preds, ml_targets, ml_datasets)):
+                valid_indices = self.dataset_label_indices[dataset]
+                if not valid_indices:
+                    continue
 
-            total_loss += sample_loss.mean()
-            valid_samples += 1
+                valid_pred = pred[valid_indices]
+                valid_target = target[valid_indices]
+
+                if self.pos_weight is not None:
+                    valid_pos_weight = self.pos_weight[valid_indices]
+                    sample_loss = self.bce_loss(valid_pred, valid_target) * valid_pos_weight
+                else:
+                    sample_loss = self.bce_loss(valid_pred, valid_target)
+
+                total_loss += sample_loss.mean()
+                valid_samples += 1
+
+        if (~multilabel_mask).any():
+            # Handle multi-class samples
+            mc_preds = predictions[~multilabel_mask]
+            mc_targets = targets[~multilabel_mask]
+            mc_datasets = [d for i, d in enumerate(datasets) if not multilabel_mask[i]]
+
+            for i, (pred, target, dataset) in enumerate(zip(mc_preds, mc_targets, mc_datasets)):
+                valid_indices = self.dataset_label_indices[dataset]
+                if not valid_indices:
+                    continue
+
+                valid_pred = pred[valid_indices]
+                valid_target = target[valid_indices]
+
+                # Convert one-hot to class index for CrossEntropyLoss
+                target_idx = valid_target.argmax()
+                sample_loss = self.ce_loss(valid_pred.unsqueeze(0), target_idx.unsqueeze(0))
+
+                total_loss += sample_loss.mean()
+                valid_samples += 1
 
         if valid_samples == 0:
             return torch.tensor(0.0, device=predictions.device, requires_grad=True)
@@ -199,12 +233,12 @@ class DatasetSpecificBCELoss(nn.Module):
 
 def sample_frames(video_path: str, num_frames: int, is_train: bool) -> List[Image.Image]:
     """
-    Sample frames from a video file.
+    Sample frames from a video file, excluding first and last frames for uniform sampling.
 
     Args:
         video_path: Path to the video file
         num_frames: Number of frames to sample
-        is_train: If True, use random sampling; if False, use uniform sampling
+        is_train: If True, use random sampling; if False, use uniform sampling excluding first/last frames
 
     Returns:
         List of PIL Images
@@ -219,8 +253,8 @@ def sample_frames(video_path: str, num_frames: int, is_train: bool) -> List[Imag
         # Random sampling for training
         frame_indices = sorted(random.sample(range(total_frames), min(num_frames, total_frames)))
     else:
-        # Uniform sampling for testing
-        frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        # Sample num_frames + 2 points uniformly, then remove first and last
+        frame_indices = np.linspace(0, total_frames - 1, num_frames + 2, dtype=int)[1:-1]
 
     frames = []
     for idx in frame_indices:
@@ -672,7 +706,6 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
 
             perfect_match = accuracy = (predictions == ds_labels).mean()
 
-
         try:
             auc = roc_auc_score(ds_labels, ds_outputs, average='weighted')
         except ValueError:
@@ -757,7 +790,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      max_grad_norm=2.0, contrastive_weight=0.5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
-                     eval_only=False, load_checkpoint=None):
+                     eval_only=False, load_checkpoint=None, no_contrastive=False):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
@@ -783,10 +816,17 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         # dynamic_image_size = True
         image_size = 448
         max_dynamic_patch = 8
+    if 'sbb2' in model_path.lower():
+        image_size = 384
+        max_dynamic_patch = 1
+    elif 'eva' in model_path.lower():
+        image_size = 448
+        max_dynamic_patch = 2
     else:
         # dynamic_image_size = False
         image_size = 224
         max_dynamic_patch = 2
+    logger.info(f'Image size: {image_size}, Max dynamic patch: {max_dynamic_patch}')
     train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
                                                      num_image_token=256, rebuild_vocab=rebuild_vocab,
                                                      is_train=True, dynamic_image_size=False,
@@ -802,10 +842,25 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     vocab_size = len(train_dataset.vocabs)
 
     # Load the model
-    if 'convnext' in model_path.lower():
+    if 'sbb2' in model_path.lower():
+        model = ViTSBBClassifier(vision_output_size=vocab_size).cuda()
+        # model = model.to(torch.bfloat16)
+    elif 'convnext' in model_path.lower():
         model = ConvNextV2Classifier.from_pretrained(
             model_path,  # or any other ConvNeXtV2 checkpoint
             vision_output_size=vocab_size
+        ).cuda()
+        model = model.to(torch.bfloat16)
+    elif 'clip' in model_path.lower():
+        model = model = OpenCLIPClassifier.from_pretrained(
+            model_path,
+            vision_output_size=vocab_size,
+            dtype=torch.bfloat16
+        ).cuda()
+    elif 'eva' in model_path.lower():
+        model = EVA02Classifier(
+            vision_output_size=vocab_size,
+            checkpoint_path="eva02_L_pt_m38m_medft_in21k_ft_in1k_p14.pt"
         ).cuda()
         model = model.to(torch.bfloat16)
     else:
@@ -851,9 +906,10 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     train_dataset.dataset_label_indices = dataset_label_indices
 
     # Initialize the dataset-specific loss function
-    loss_fn = DatasetSpecificBCELoss(
-        dataset_label_indices=dataset_label_indices
-        # pos_weight=train_dataset.pos_weight.cuda()
+    loss_fn = MixedClassificationLoss(
+        dataset_label_indices=dataset_label_indices,
+        multilabel_datasets=train_dataset.dataset_multilabel,
+        pos_weight=train_dataset.pos_weight.cuda()
     )
 
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
@@ -895,12 +951,15 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             datasets = batch['dataset']
 
             features = model.forward_vision(pixel_values, attention_mask=attention_mask, classify=False)
-            positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
-                                                    classify=False)
             outputs = model.classify(features)
 
             classification_loss = loss_fn(outputs, labels, datasets)
-            contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
+            if no_contrastive:
+                contr_loss = torch.tensor(0.0, device=features.device)
+            else:
+                positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
+                                                        classify=False)
+                contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
 
             # Backward pass
             total_loss = classification_loss + contrastive_weight * contr_loss
@@ -958,10 +1017,11 @@ if __name__ == '__main__':
     arg_parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_valid.json')
     arg_parser.add_argument('--eval_only', action='store_true')
     arg_parser.add_argument('--load_checkpoint', type=str, default=None)
+    arg_parser.add_argument('--no_contrastive', action='store_true')
 
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
                      lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
                      meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path,
                      eval_only=args.eval_only,
-                     load_checkpoint=args.load_checkpoint)
+                     load_checkpoint=args.load_checkpoint, no_contrastive=args.no_contrastive)
