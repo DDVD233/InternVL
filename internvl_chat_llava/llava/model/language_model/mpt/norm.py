@@ -1,5 +1,6 @@
 import torch
 
+
 def _cast_if_autocast_enabled(tensor):
     if torch.is_autocast_enabled():
         if tensor.device.type == 'cuda':

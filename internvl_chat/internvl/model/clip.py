@@ -1,6 +1,7 @@
+import logging
+
 import torch
 import torch.nn as nn
-import logging
 from open_clip import create_model_and_transforms
 
 logger = logging.getLogger(__name__)

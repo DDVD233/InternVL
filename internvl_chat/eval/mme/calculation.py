@@ -1,8 +1,7 @@
 import argparse
 import os
 
-from sklearn.metrics import (accuracy_score, confusion_matrix, precision_score,
-                             recall_score)
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--results_dir', default='./LaVIN', type=str)

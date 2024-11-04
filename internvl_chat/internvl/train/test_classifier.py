@@ -1,37 +1,33 @@
 import argparse
 import copy
+import gc
+import json
+import logging
+import math
+import os
+import random
 import sys
+import warnings
+from collections import defaultdict
 from typing import Dict, List
 
 import cv2
-import wandb
-from torch import nn
-
-from internvl.model.eva_classifier import EVA02Classifier
-from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
-import gc
-import json
-import math
-import os
-import warnings
-from internvl.train.dataset import build_transform, dynamic_preprocess
-from PIL import Image
-from torch.utils.data import Dataset
-
 import numpy as np
 import torch
-from torch.utils.data import Subset
-import random
-from sklearn.metrics import roc_auc_score, hamming_loss, confusion_matrix, f1_score
-from collections import defaultdict
+import torch.nn.functional as F
 import tqdm
 import wandb
-import logging
-import torch.nn.functional as F
-from internvl.model.convnext import ConvNextV2Classifier
-from internvl.model.sbb_vit import ViTSBBClassifier
-from transformers import get_cosine_schedule_with_warmup
 from internvl.model.clip import OpenCLIPClassifier
+from internvl.model.convnext import ConvNextV2Classifier
+from internvl.model.eva_classifier import EVA02Classifier
+from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
+from internvl.model.sbb_vit import ViTSBBClassifier
+from internvl.train.dataset import build_transform, dynamic_preprocess
+from PIL import Image
+from sklearn.metrics import confusion_matrix, f1_score, hamming_loss, roc_auc_score
+from torch import nn
+from torch.utils.data import Dataset, Subset
+from transformers import get_cosine_schedule_with_warmup
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

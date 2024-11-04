@@ -11,8 +11,7 @@ https://github.com/microsoft/unilm/blob/master/beit/semantic_segmentation/mmcv_c
 
 import json
 
-from mmcv.runner import (OPTIMIZER_BUILDERS, DefaultOptimizerConstructor,
-                         get_dist_info)
+from mmcv.runner import DefaultOptimizerConstructor, get_dist_info, OPTIMIZER_BUILDERS
 from mmseg.utils import get_root_logger
 
 

@@ -16,10 +16,8 @@
 from typing import Optional, Tuple
 
 import torch
-
-from transformers import AutoConfig, AutoModelForCausalLM, \
-    MptConfig, MptForCausalLM, MptModel
-from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from llava.model.llava_arch import LlavaMetaForCausalLM, LlavaMetaModel
+from transformers import AutoConfig, AutoModelForCausalLM, MptConfig, MptForCausalLM, MptModel
 
 
 class LlavaMptConfig(MptConfig):

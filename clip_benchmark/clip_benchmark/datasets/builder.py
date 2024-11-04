@@ -6,11 +6,10 @@ from subprocess import call
 
 import torch
 from torch.utils.data import default_collate
-from torchvision.datasets import (CIFAR10, CIFAR100, DTD, GTSRB, MNIST, PCAM,
-                                  STL10, SUN397, CocoCaptions, Country211,
-                                  EuroSAT, FGVCAircraft, Flowers102, Food101,
-                                  ImageFolder, ImageNet, OxfordIIITPet,
-                                  RenderedSST2, StanfordCars)
+from torchvision.datasets import (
+    CIFAR10, CIFAR100, CocoCaptions, Country211, DTD, EuroSAT, FGVCAircraft, Flowers102, Food101, GTSRB, ImageFolder, ImageNet,
+    MNIST, OxfordIIITPet, PCAM, RenderedSST2, StanfordCars, STL10, SUN397
+)
 
 from . import caltech101, flickr, imagenetv2, objectnet, voc2007
 from .birdsnap import BirdsnapV2
@@ -521,8 +520,7 @@ def has_kaggle():
 
 def build_vtab_dataset(dataset_name, transform, download=True, split='test', data_dir='root', classnames=[]):
     # Using VTAB splits instead of default TFDS splits
-    from .tfds import (VTABIterableDataset, disable_gpus_on_tensorflow,
-                       download_tfds_dataset)
+    from .tfds import disable_gpus_on_tensorflow, download_tfds_dataset, VTABIterableDataset
 
     # avoid Tensorflow owning GPUs to not clash with PyTorch
     disable_gpus_on_tensorflow()

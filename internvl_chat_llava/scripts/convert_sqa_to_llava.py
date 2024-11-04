@@ -1,7 +1,8 @@
 import json
 import os
-import fire
 import re
+
+import fire
 from convert_sqa_to_llava_base_prompt import build_prompt_chatbot
 
 

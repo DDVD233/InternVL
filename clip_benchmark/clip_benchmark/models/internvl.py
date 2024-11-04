@@ -5,8 +5,7 @@
 # --------------------------------------------------------
 
 from .internvl_c_pytorch import load_internvl_c_pytorch
-from .internvl_huggingface import (load_internvl_c_huggingface,
-                                   load_internvl_g_huggingface)
+from .internvl_huggingface import load_internvl_c_huggingface, load_internvl_g_huggingface
 
 
 def load_internvl(model_name, pretrained, cache_dir, device):

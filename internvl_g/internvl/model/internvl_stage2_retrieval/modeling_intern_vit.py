@@ -12,8 +12,7 @@ from einops import rearrange
 from timm.models.layers import DropPath
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (BaseModelOutput,
-                                           BaseModelOutputWithPooling)
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 

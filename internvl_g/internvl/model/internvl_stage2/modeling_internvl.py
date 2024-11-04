@@ -12,17 +12,16 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from peft import LoraConfig, get_peft_model
+from peft import get_peft_model, LoraConfig
 from timm.models.layers import DropPath
 from torch import nn
 from transformers import GenerationConfig
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, logging
+from transformers.utils import logging, ModelOutput
 
 from .configuration_internvl import InternVLConfig
-from .modeling_intern_vit import (InternVisionEmbeddings, InternVisionEncoder,
-                                  InternVisionModel)
-from .modeling_qllama import LlamaForCausalLM, _expand_mask, _make_causal_mask
+from .modeling_intern_vit import InternVisionEmbeddings, InternVisionEncoder, InternVisionModel
+from .modeling_qllama import _expand_mask, _make_causal_mask, LlamaForCausalLM
 
 try:
     from .flash_attention import FlashAttention  # v1/v2

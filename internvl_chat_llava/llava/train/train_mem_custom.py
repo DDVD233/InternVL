@@ -7,8 +7,8 @@
 
 # replace_llama_attn_with_flash_attn()
 
-from llava.train.train_custom import train
 from llava.train.dist_utils import init_dist
+from llava.train.train_custom import train
 
 if __name__ == "__main__":
     try:

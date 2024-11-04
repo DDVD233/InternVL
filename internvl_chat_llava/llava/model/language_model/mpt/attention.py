@@ -2,12 +2,15 @@
 import math
 import warnings
 from typing import Optional
+
 import torch
 import torch.nn as nn
 from einops import rearrange
 from packaging import version
 from torch import nn
+
 from .norm import LPLayerNorm
+
 
 def _reset_is_causal(num_query_tokens: int, num_key_tokens: int, original_is_causal: bool):
     if original_is_causal and num_query_tokens != num_key_tokens:

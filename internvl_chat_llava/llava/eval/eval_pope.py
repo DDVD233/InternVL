@@ -1,6 +1,7 @@
-import os
-import json
 import argparse
+import json
+import os
+
 
 def eval_pope(answers, label_file):
     label_list = [json.loads(q)['label'] for q in open(label_file, 'r')]

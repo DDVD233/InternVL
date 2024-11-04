@@ -4,8 +4,7 @@ import torch.nn as nn
 from einops import rearrange
 
 try:  # v1
-    from flash_attn.flash_attn_interface import \
-        flash_attn_unpadded_qkvpacked_func
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
 except:  # v2
     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func
 

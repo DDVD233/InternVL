@@ -10,7 +10,7 @@ import cv2
 import imageio
 import numpy as np
 import torch
-from decord import VideoReader, cpu
+from decord import cpu, VideoReader
 from internvl.model import load_model_and_tokenizer
 from internvl.train.dataset import build_transform, dynamic_preprocess
 from PIL import Image

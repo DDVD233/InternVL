@@ -1,12 +1,11 @@
 import torch
 
-from .layer_decay_optimizer_constructor import \
-    CustomLayerDecayOptimizerConstructor
+from .layer_decay_optimizer_constructor import CustomLayerDecayOptimizerConstructor
 
 __all__ = ['CustomLayerDecayOptimizerConstructor',]
 
 
-from mmcv.runner.hooks import HOOKS, Hook
+from mmcv.runner.hooks import Hook, HOOKS
 from mmcv.runner.optimizer.builder import OPTIMIZERS
 from torch.distributed.optim import ZeroRedundancyOptimizer
 

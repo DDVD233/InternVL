@@ -1,6 +1,6 @@
-import os
 import argparse
 import json
+import os
 
 from llava.eval.m4c_evaluator import EvalAIAnswerProcessor
 

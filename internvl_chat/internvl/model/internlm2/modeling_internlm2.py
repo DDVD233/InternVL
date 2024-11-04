@@ -27,13 +27,9 @@ from einops import rearrange
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (BaseModelOutputWithPast,
-                                           CausalLMOutputWithPast,
-                                           SequenceClassifierOutputWithPast)
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import (add_start_docstrings,
-                                add_start_docstrings_to_model_forward, logging,
-                                replace_return_docstrings)
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 
 try:
     from transformers.generation.streamers import BaseStreamer
@@ -67,10 +63,8 @@ def _import_flash_attn():
     global pad_input, index_first_axis, unpad_input
     try:
         from flash_attn import flash_attn_func as _flash_attn_func
-        from flash_attn import \
-            flash_attn_varlen_func as _flash_attn_varlen_func
-        from flash_attn.bert_padding import \
-            index_first_axis as _index_first_axis
+        from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
+        from flash_attn.bert_padding import index_first_axis as _index_first_axis
         from flash_attn.bert_padding import pad_input as _pad_input
         from flash_attn.bert_padding import unpad_input as _unpad_input
         flash_attn_func, flash_attn_varlen_func = _flash_attn_func, _flash_attn_varlen_func

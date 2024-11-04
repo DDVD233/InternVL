@@ -5,7 +5,7 @@ import os
 import av
 import numpy as np
 import torch
-from decord import VideoReader, cpu
+from decord import cpu, VideoReader
 from PIL import Image
 from tqdm.auto import tqdm
 

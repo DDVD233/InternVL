@@ -42,9 +42,11 @@ than CUDA forward + backward.
 - Triton version supports attention bias, while CUDA version doesn't.
 """
 import math
+
 import torch
 import triton_pre_mlir as triton
 import triton_pre_mlir.language as tl
+
 
 @triton.heuristics({'EVEN_M': lambda args: args['seqlen_q'] % args['BLOCK_M'] == 0, 'EVEN_N': lambda args: args['seqlen_k'] % args['BLOCK_N'] == 0, 'EVEN_HEADDIM': lambda args: args['headdim'] == args['BLOCK_HEADDIM']})
 @triton.jit

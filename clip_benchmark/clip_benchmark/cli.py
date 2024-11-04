@@ -7,17 +7,12 @@ import sys
 from copy import copy
 
 import torch
-
-from clip_benchmark.datasets.builder import (build_dataset, dataset_collection,
-                                             get_dataset_collate_fn,
-                                             get_dataset_collection_from_file,
-                                             get_dataset_default_task)
-from clip_benchmark.metrics import (linear_probe, mscoco_generative,
-                                    zeroshot_classification,
-                                    zeroshot_retrieval)
-from clip_benchmark.model_collection import (get_model_collection_from_file,
-                                             model_collection)
-from clip_benchmark.models import MODEL_TYPES, load_clip
+from clip_benchmark.datasets.builder import (
+    build_dataset, dataset_collection, get_dataset_collate_fn, get_dataset_collection_from_file, get_dataset_default_task
+)
+from clip_benchmark.metrics import linear_probe, mscoco_generative, zeroshot_classification, zeroshot_retrieval
+from clip_benchmark.model_collection import get_model_collection_from_file, model_collection
+from clip_benchmark.models import load_clip, MODEL_TYPES
 
 
 def get_parser_args():

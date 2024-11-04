@@ -1,24 +1,22 @@
-import ujson as json
+import argparse
 import os
 from collections import defaultdict
 from typing import List, Literal
 
 import torch
-from transformers import AutoTokenizer
-from models.InternVL.internvl_chat.internvl.model.internvl_chat import InternVLChatModel
-from torchmetrics import Accuracy, F1Score, Specificity, Recall
-from models.InternVL.internvl_chat.internvl.train.internvl_chat_finetune import LazySupervisedDataset, \
-    concat_pad_data_collator
-from models.InternVL.internvl_chat.internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
-                                                                    IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
-                                                                    IMG_START_TOKEN, QUAD_END_TOKEN,
-                                                                    QUAD_START_TOKEN, REF_END_TOKEN,
-                                                                    REF_START_TOKEN)
-from transformers.modeling_outputs import CausalLMOutputWithPast
+import ujson as json
+from torchmetrics import Accuracy, F1Score, Recall, Specificity
 # prog bar
 from tqdm import tqdm
+from transformers import AutoTokenizer
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
-import argparse
+from models.InternVL.internvl_chat.internvl.model.internvl_chat import InternVLChatModel
+from models.InternVL.internvl_chat.internvl.train.constants import (
+    BOX_END_TOKEN, BOX_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN, QUAD_END_TOKEN, QUAD_START_TOKEN,
+    REF_END_TOKEN, REF_START_TOKEN
+)
+from models.InternVL.internvl_chat.internvl.train.internvl_chat_finetune import concat_pad_data_collator, LazySupervisedDataset
 
 
 def test_model(meta_path, dataset_name, path, modality='all'):

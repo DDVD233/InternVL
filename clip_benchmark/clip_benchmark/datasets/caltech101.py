@@ -9,8 +9,7 @@ from glob import glob
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from PIL import Image
-from torchvision.datasets.utils import (download_and_extract_archive,
-                                        verify_str_arg)
+from torchvision.datasets.utils import download_and_extract_archive, verify_str_arg
 from torchvision.datasets.vision import VisionDataset
 
 

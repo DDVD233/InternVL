@@ -20,15 +20,14 @@ from config import get_config
 from dataset import build_loader
 from logger import create_logger
 from lr_scheduler import build_scheduler
-from models import build_model
 from optimizer import build_optimizer
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from timm.utils import ApexScaler, AverageMeter, ModelEma, accuracy
-from utils import MyAverageMeter
+from timm.utils import accuracy, ApexScaler, AverageMeter, ModelEma
+
+from models import build_model
+from utils import auto_resume_helper, get_grad_norm, load_checkpoint, load_ema_checkpoint, load_pretrained, MyAverageMeter
 from utils import NativeScalerWithGradNormCount as NativeScaler
-from utils import (auto_resume_helper, get_grad_norm, load_checkpoint,
-                   load_ema_checkpoint, load_pretrained, reduce_tensor,
-                   save_checkpoint)
+from utils import reduce_tensor, save_checkpoint
 
 try:
     from apex import amp

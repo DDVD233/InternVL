@@ -19,11 +19,9 @@ import os
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple
 
-from tokenizers import Tokenizer, decoders, normalizers, processors
+from tokenizers import decoders, normalizers, processors, Tokenizer
 from tokenizers.models import BPE
-from transformers.convert_slow_tokenizer import (SLOW_TO_FAST_CONVERTERS,
-                                                 SentencePieceExtractor,
-                                                 SpmConverter)
+from transformers.convert_slow_tokenizer import SentencePieceExtractor, SLOW_TO_FAST_CONVERTERS, SpmConverter
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from transformers.utils import logging
 

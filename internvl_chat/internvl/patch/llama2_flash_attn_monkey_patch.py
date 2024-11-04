@@ -8,10 +8,8 @@ from typing import Optional, Tuple
 import torch
 from flash_attn import __version__ as flash_attn_version
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import (flash_attn_func,
-                                             flash_attn_varlen_kvpacked_func)
-from transformers.models.llama.modeling_llama import (LlamaAttention,
-                                                      LlamaModel, rotate_half)
+from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_kvpacked_func
+from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel, rotate_half
 
 
 def apply_rotary_pos_emb(q, k, cos_sin, position_ids):
@@ -141,8 +139,7 @@ def replace_llama2_attn_with_flash_attn():
 
 
 def test():
-    from fastchat.train.llama_flash_attn_monkey_patch import \
-        forward as fastchat_forward
+    from fastchat.train.llama_flash_attn_monkey_patch import forward as fastchat_forward
     from transformers.models.llama.configuration_llama import LlamaConfig
 
     config = LlamaConfig(

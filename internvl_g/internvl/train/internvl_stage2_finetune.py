@@ -8,16 +8,13 @@ from typing import Dict, Optional
 import torch.distributed as dist
 import transformers
 from internvl.dist_utils import init_dist
-from internvl.model.internvl_stage2_retrieval import (InternVLConfig,
-                                                      InternVLModel)
+from internvl.model.internvl_stage2_retrieval import InternVLConfig, InternVLModel
 from internvl.train.dataset import COCODataset, FlickrDataset
 from internvl.train.trainer_monkey_patch import replace_create_optimizer
 from PIL import Image, ImageFile, PngImagePlugin
-from transformers import (HfArgumentParser, LlamaTokenizer, Trainer,
-                          TrainingArguments, default_data_collator, set_seed)
+from transformers import default_data_collator, HfArgumentParser, LlamaTokenizer, set_seed, Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils.logging import (enable_default_handler,
-                                        enable_explicit_format, set_verbosity)
+from transformers.utils.logging import enable_default_handler, enable_explicit_format, set_verbosity
 
 IGNORE_INDEX = -100
 Image.MAX_IMAGE_PIXELS = None

@@ -1,13 +1,10 @@
 import os
-import torch
-
-from torch.utils.data import Sampler
-
-from transformers import Trainer
-from transformers.trainer import (
-    has_length,
-)
 from typing import List, Optional
+
+import torch
+from torch.utils.data import Sampler
+from transformers import Trainer
+from transformers.trainer import has_length
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):

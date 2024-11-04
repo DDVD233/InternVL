@@ -11,22 +11,20 @@
 
 
 import math
+import numbers
 from functools import partial
+from typing import List, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from torch.nn.parameter import Parameter
-from timm.models.layers import drop_path, to_2tuple, trunc_normal_
-from timm.models import register_model
-
-from torch import Tensor, Size
-from typing import Union, List
-import numbers
-
 import xformers.ops as xops
 from apex.normalization import FusedLayerNorm
+from timm.models import register_model
+from timm.models.layers import drop_path, to_2tuple, trunc_normal_
+from torch import Size, Tensor
+from torch.nn.parameter import Parameter
 
 from .rope import *
 

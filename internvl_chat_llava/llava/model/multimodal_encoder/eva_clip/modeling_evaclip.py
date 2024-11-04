@@ -23,17 +23,13 @@ from typing import Any, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import (
-    ModelOutput,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-    replace_return_docstrings,
+    add_start_docstrings, add_start_docstrings_to_model_forward, logging, ModelOutput, replace_return_docstrings
 )
+
 from .configuration_evaclip import EvaCLIPConfig, EvaCLIPTextConfig, EvaCLIPVisionConfig
 
 logger = logging.get_logger(__name__)

@@ -22,7 +22,7 @@ from mmcv.fileio import FileClient
 from PIL import Image
 from tqdm import tqdm, trange
 
-from .zipreader import ZipReader, is_zip_path
+from .zipreader import is_zip_path, ZipReader
 
 _logger = logging.getLogger(__name__)
 

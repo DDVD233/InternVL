@@ -1,7 +1,9 @@
-import os
-import json
 import argparse
+import json
+import os
+
 import pandas as pd
+
 
 def get_args():
     parser = argparse.ArgumentParser()
