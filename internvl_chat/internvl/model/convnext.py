@@ -15,6 +15,7 @@ class ConvNextV2Classifier(PreTrainedModel):
         super().__init__(config)
 
         self.vision_model = ConvNextV2Model(config)
+        self.img_size = config.img_size
         hidden_size = config.hidden_sizes[-1]  # Use the last stage's hidden size
 
         # Calculate the output dimension after global average pooling
