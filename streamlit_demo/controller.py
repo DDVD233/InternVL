@@ -8,7 +8,7 @@ import json
 import re
 import threading
 import time
-from enum import Enum, auto
+from enum import auto, Enum
 from typing import List
 
 import numpy as np
@@ -16,6 +16,7 @@ import requests
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+
 from utils import build_logger, server_error_msg
 
 CONTROLLER_HEART_BEAT_EXPIRATION = 30

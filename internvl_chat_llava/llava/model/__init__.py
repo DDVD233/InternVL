@@ -1,2 +1,2 @@
-from .language_model.llava_llama import LlavaLlamaForCausalLM, LlavaConfig
-from .language_model.llava_mpt import LlavaMptForCausalLM, LlavaMptConfig
+from .language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM
+from .language_model.llava_mpt import LlavaMptConfig, LlavaMptForCausalLM

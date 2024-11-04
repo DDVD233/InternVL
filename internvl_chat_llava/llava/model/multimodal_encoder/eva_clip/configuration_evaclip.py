@@ -19,8 +19,7 @@
 import copy
 import os
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
-
+from typing import Any, Mapping, Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
@@ -28,7 +27,6 @@ if TYPE_CHECKING:
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
-
 
 logger = logging.get_logger(__name__)
 

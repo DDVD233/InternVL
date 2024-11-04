@@ -1,8 +1,9 @@
-import torch
-import torch.nn as nn
-import timm
 import logging
 from typing import Optional
+
+import timm
+import torch
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 

@@ -10,8 +10,9 @@ import time
 
 import torch
 from config import get_config
-from models import build_model
 from tqdm import tqdm
+
+from models import build_model
 
 
 def get_args():

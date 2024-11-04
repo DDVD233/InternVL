@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, TextIteratorStreamer
+
 from utils import build_logger, pretty_print_semaphore, server_error_msg
 
 worker_id = str(uuid.uuid4())[:6]

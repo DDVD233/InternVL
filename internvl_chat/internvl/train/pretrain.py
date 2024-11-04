@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import random
@@ -7,14 +8,12 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
-from torch.utils.data import Dataset, DataLoader
-import json
-from PIL import Image
 import tqdm
-
+import wandb
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 from internvl.train.dataset import build_transform, dynamic_preprocess
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

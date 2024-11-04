@@ -22,11 +22,12 @@ from ddp_hooks import fp16_compress_hook
 from ema_deepspeed import EMADeepspeed
 from logger import create_logger
 from lr_scheduler import build_scheduler
-from models import build_model
 from optimizer import set_weight_decay_and_lr
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from timm.utils import AverageMeter, accuracy
-from utils import MyAverageMeter, load_pretrained, reduce_tensor
+from timm.utils import accuracy, AverageMeter
+
+from models import build_model
+from utils import load_pretrained, MyAverageMeter, reduce_tensor
 
 
 def parse_option():
@@ -469,8 +470,7 @@ def eval(config):
             logger.info(msg)
         except:
             try:
-                from deepspeed.utils.zero_to_fp32 import \
-                    get_fp32_state_dict_from_zero_checkpoint
+                from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
                 ckpt_dir = os.path.dirname(config.MODEL.RESUME)
                 tag = os.path.basename(config.MODEL.RESUME)
                 state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir=ckpt_dir, tag=tag)

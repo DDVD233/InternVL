@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn as nn
 import transformers
-from transformers import Trainer, logging
+from transformers import logging, Trainer
 from transformers.trainer import is_sagemaker_mp_enabled
 
 logger = logging.get_logger(__name__)

@@ -10,7 +10,7 @@ import torch.utils.checkpoint
 import transformers
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.utils import ModelOutput, logging
+from transformers.utils import logging, ModelOutput
 
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel

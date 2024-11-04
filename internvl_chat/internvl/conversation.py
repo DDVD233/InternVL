@@ -6,7 +6,7 @@ If you have changes in mind, please contribute back so the community can benefit
 """
 
 import dataclasses
-from enum import IntEnum, auto
+from enum import auto, IntEnum
 from typing import Any, Dict, List, Tuple, Union
 
 

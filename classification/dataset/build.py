@@ -9,7 +9,7 @@ import os
 import numpy as np
 import torch
 import torch.distributed as dist
-from timm.data import Mixup, create_transform
+from timm.data import create_transform, Mixup
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 

@@ -1,12 +1,14 @@
+import logging
+import math
+from functools import partial
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
-from typing import Optional
-from functools import partial
-from apex.normalization import FusedLayerNorm
-import math
 import torch.utils.checkpoint as checkpoint
+from apex.normalization import FusedLayerNorm
+
 from .eva import VisionTransformer
 
 logger = logging.getLogger(__name__)

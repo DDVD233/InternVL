@@ -2,9 +2,9 @@ import logging
 
 import torch
 import torch.nn as nn
+from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModel
 
-from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
-from .eva_clip.configuration_evaclip  import EvaCLIPVisionConfig
+from .eva_clip.configuration_evaclip import EvaCLIPVisionConfig
 from .eva_clip.modeling_evaclip import EvaCLIPVisionModel
 from .intern_vit_6b.configuration_intern_vit import InternVisionConfig
 from .intern_vit_6b.modeling_intern_vit import InternVisionModel

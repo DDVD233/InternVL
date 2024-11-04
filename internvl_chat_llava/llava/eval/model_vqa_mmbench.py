@@ -1,20 +1,18 @@
 import argparse
-import torch
-import os
 import json
-import pandas as pd
-from tqdm import tqdm
-import shortuuid
+import math
+import os
 
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+import pandas as pd
+import shortuuid
+import torch
+from llava.constants import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates, SeparatorStyle
+from llava.mm_utils import get_model_name_from_path, load_image_from_base64, process_images, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path
-
 from PIL import Image
-import math
-
+from tqdm import tqdm
 
 all_options = ['A', 'B', 'C', 'D']
 

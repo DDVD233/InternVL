@@ -5,6 +5,7 @@
 # --------------------------------------------------------
 import os
 import warnings
+from functools import partial
 from typing import Any, List, Optional, Tuple, Union
 
 import torch.distributed as dist
@@ -13,21 +14,18 @@ import transformers
 from internvl.conversation import get_conv_template
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.phi3.modeling_phi3 import Phi3ForCausalLM
-from peft import LoraConfig, get_peft_model
+from peft import get_peft_model, LoraConfig
+from timm.models.layers import DropPath
 from torch import nn
 from torch.nn import CrossEntropyLoss
-from transformers import (AutoModel, GenerationConfig, LlamaForCausalLM,
-                          LlamaTokenizer, Qwen2ForCausalLM)
+from torch.nn import functional as F
+from transformers import AutoModel, GenerationConfig, LlamaForCausalLM, LlamaTokenizer, Qwen2ForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, logging
+from transformers.utils import logging, ModelOutput
 
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
-
-from functools import partial
-from torch.nn import functional as F
-from timm.models.layers import DropPath
 
 logger = logging.get_logger(__name__)
 

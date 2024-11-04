@@ -21,11 +21,12 @@ from config import get_config
 from dataset import build_loader2
 from ddp_hooks import fp16_compress_hook
 from lr_scheduler import build_scheduler
-from models import build_model
 from optimizer import build_optimizer
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from timm.utils import AverageMeter, ModelEma, accuracy
+from timm.utils import accuracy, AverageMeter, ModelEma
 from tqdm import tqdm
+
+from models import build_model
 from utils import load_ema_checkpoint, load_pretrained
 
 logger = get_logger(__name__)
