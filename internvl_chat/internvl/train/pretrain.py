@@ -2,8 +2,7 @@ import argparse
 import json
 import logging
 import os
-import random
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,9 +10,11 @@ import torch.nn.functional as F
 import tqdm
 import wandb
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
-from internvl.train.dataset import build_transform, dynamic_preprocess
+from internvl.train.dataset import build_transform
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+
+from internvl.train.pretrain_utils import get_2d_sincos_pos_embed, patchify
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ class MAEDecoder(nn.Module):
 class MAEPretrainingWrapper(nn.Module):
     def __init__(
             self,
-            base_model: InternVLChatModel,
+            base_model: torch.nn.modules,
             mask_ratio: float = 0.75,
             decoder_embed_dim: int = 512,
     ):
@@ -123,7 +124,7 @@ class MAEPretrainingWrapper(nn.Module):
             self,
             x: torch.Tensor,
             mask_ratio: float
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
 
@@ -177,6 +178,7 @@ class PretrainingDataset(Dataset):
 
         # Load metadata
         self.images = []
+        self.captions = []
         with open(meta_path, 'r') as f:
             meta = json.load(f)
 
@@ -188,6 +190,14 @@ class PretrainingDataset(Dataset):
                     if 'images' in data:
                         for image in data['images']:
                             self.images.append(os.path.join(root, image))
+                    target = data['conversations'][1]['value'].lower()
+                    modality = ds_name.split('_')[0]  # chest, derm, mammo, etc
+                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm', 'dermoscopy')
+                    modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
+                    caption = modality + ', ' + target
+                    self.captions.append(caption)
+
+        self.unique_captions = list(set(self.captions))
 
         logger.info(f'Loaded {len(self.images)} images for pretraining')
         self.transform = build_transform(
@@ -207,72 +217,10 @@ class PretrainingDataset(Dataset):
             logger.error(f'Error loading image {image_path}: {e}')
             image = torch.zeros((3, self.image_size, self.image_size))
 
-        return {'pixel_values': image}
+        return {'pixel_values': image, 'caption': self.captions[idx]}
 
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = torch.arange(grid_size, dtype=torch.float32)
-    grid_w = torch.arange(grid_size, dtype=torch.float32)
-    grid = torch.meshgrid(grid_w, grid_h, indexing='ij')
-    grid = torch.stack(grid, dim=0)
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = torch.cat([torch.zeros([1, embed_dim]), pos_embed], dim=0)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = torch.cat([emb_h, emb_w], dim=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000 ** omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = torch.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
-
-    emb_sin = torch.sin(out)  # (M, D/2)
-    emb_cos = torch.cos(out)  # (M, D/2)
-
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
-    return emb
-
-
-def patchify(imgs):
-    """Convert a batch of images into a batch of patches."""
-    # imgs: (N, 3, H, W)
-    p = 14  # patch size
-    assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
-
-    h = w = imgs.shape[2] // p
-    x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
-    x = torch.einsum('nchpwq->nhwpqc', x)
-    x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * 3))
-    return x
-
-
-def train_mae(
+def train(
         model_path: str,
         output_path: str,
         meta_train_path: str,
@@ -497,7 +445,7 @@ if __name__ == '__main__':
     if args.resume:
         logger.info(f'Resuming training from checkpoint: {args.resume}')
 
-    train_mae(
+    train(
         model_path=args.model_path,
         output_path=args.output_path,
         meta_train_path=args.meta_train_path,

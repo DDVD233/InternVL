@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import random
-import sys
 import warnings
 from collections import defaultdict
 from typing import Dict, List
@@ -28,6 +27,7 @@ from sklearn.metrics import confusion_matrix, f1_score, hamming_loss, roc_auc_sc
 from torch import nn
 from torch.utils.data import Dataset, Subset
 from transformers import get_cosine_schedule_with_warmup
+from internvl.train.soap import SOAP
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -108,6 +108,7 @@ def collate_fn(batch):
         padded_negative_indices = None
 
     questions = [item['question'] for item in batch]
+    captions = [item['caption'] for item in batch]
     dataset = [item['dataset'] for item in batch]
     max_question_length = max(len(q) for q in questions)
     padded_questions = [q.ljust(max_question_length) for q in questions]
@@ -120,6 +121,7 @@ def collate_fn(batch):
         'positive_attention_mask': positive_attention_mask,
         'labels': labels,
         'questions': padded_questions,
+        'captions': captions,
         'targets': targets,
         'dataset': dataset,
         'negative_indices': padded_negative_indices
@@ -330,6 +332,11 @@ class LazySupervisedDataset(Dataset):
                     vocabs.extend(targets)
                     data['targets'] = targets
                     data['dataset'] = ds_name
+                    modality = ds_name.split('_')[0]  # chest, derm, mammo, etc
+                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm', 'dermoscopy')
+                    modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
+                    data['modality'] = modality
+                    data['caption'] = modality + ', ' + target
                     data_items.append(data)
                     bar.update(1)
 
@@ -485,6 +492,7 @@ class LazySupervisedDataset(Dataset):
             labels=data_item['labels'],
             targets=data_item['targets'],
             question=question,
+            caption=data_item['caption'],
             dataset=dataset,
         )
         return ret
@@ -894,7 +902,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Calculate total steps for the scheduler
     total_steps = len(dataloader) * epochs
-    warmup_steps = 500  # 1/30 of total steps for warmup
+    warmup_steps = 200  # 1/30 of total steps for warmup
 
     dataset_label_indices = build_dataset_label_indices(train_dataset.data_items, train_dataset.vocabs)
 
@@ -909,13 +917,15 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     )
 
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = SOAP(model.parameters(), lr=lr, weight_decay=wd)
 
     # Initialize the learning rate scheduler
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps
+        num_training_steps=total_steps,
+        num_cycles=1.5
     )
 
     if eval_only:
