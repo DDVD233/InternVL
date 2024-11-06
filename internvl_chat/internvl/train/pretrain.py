@@ -16,13 +16,18 @@ import wandb
 from sklearn.metrics import roc_auc_score, confusion_matrix
 from torchvision import transforms
 from transformers import get_cosine_schedule_with_warmup
+from internvl.model.clip import OpenCLIPClassifier
+from internvl.model.convnext import ConvNextV2Classifier
+from internvl.model.eva_classifier import EVA02Classifier
+from internvl.model.sbb_vit import ViTSBBClassifier
+from transformers import CLIPTextModel, CLIPTokenizer
 
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel, AttentionPoolingBlock
 from internvl.train.dataset import build_transform
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 from functools import partial
-from .soap import SOAP
+from internvl.train.soap import SOAP
 
 from internvl.train.pretrain_utils import get_2d_sincos_pos_embed, patchify
 
@@ -120,14 +125,32 @@ class MAEContrastiveWrapper(nn.Module):
             mask_ratio: float = 0.75,
             decoder_embed_dim: int = 512,
             temperature: float = 0.07,
-            contrastive_weight: float = 0.5
+            contrastive_weight: float = 0.5,
+            clip_text_model: str = "openai/clip-vit-large-patch14",
+            label_smoothing: float = 0.1,
+            device: str = "cuda"
     ):
         super().__init__()
         self.encoder = base_model.vision_model
-        self.text_encoder = base_model.text_model
+        self.base_model = base_model.to(device)
         self.mask_ratio = mask_ratio
         self.temperature = temperature
         self.contrastive_weight = contrastive_weight
+        self.label_smoothing = label_smoothing
+        self.device = device
+
+        # Learned temperature parameter
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
+
+        # Try to get text model from base model, otherwise initialize CLIP
+        if hasattr(base_model, 'text_model'):
+            logger.info("Using text encoder from base model")
+            self.text_encoder = base_model.text_model
+            self.tokenizer = base_model.text_tokenizer
+        else:
+            logger.info(f"Base model has no text encoder, initializing CLIP text encoder from {clip_text_model}")
+            self.text_encoder = CLIPTextModel.from_pretrained(clip_text_model)
+            self.tokenizer = CLIPTokenizer.from_pretrained(clip_text_model)
 
         # MAE decoder
         encoder_embed_dim = self.encoder.config.hidden_size
@@ -139,16 +162,16 @@ class MAEContrastiveWrapper(nn.Module):
         # Determine output dimension by running a sample forward pass
         with torch.no_grad():
             # Create a blank image tensor with correct dimensions
-            dummy_image = torch.zeros(1, 3,
+            dummy_image = torch.zeros(1, 1, 3,
                                       self.encoder.config.image_size,
                                       self.encoder.config.image_size)
             # Move to same device and dtype as encoder
             dummy_image = dummy_image.to(
-                device=next(self.encoder.parameters()).device,
+                device=device,
                 dtype=next(self.encoder.parameters()).dtype
             )
             # Get output size from image encoder
-            out_dim = self.encoder.forward_vision(dummy_image).shape[-1]
+            out_dim = self.base_model.forward_vision(dummy_image, classify=False).shape[-1]
             logger.info(f"Detected vision encoder output dimension: {out_dim}")
 
         # Text projection with matched output dimension
@@ -166,6 +189,35 @@ class MAEContrastiveWrapper(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         self._init_attention_pool()
+
+    def encode_text(self, input_ids, attention_mask):
+        """Text encoding with proper handling of both base model and CLIP text encoders"""
+        text_outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        # Get all hidden states instead of just [CLS]
+        hidden_states = text_outputs.last_hidden_state
+
+        # Apply attention pooling
+        text_embeds = self.text_projection(hidden_states)
+
+        return F.normalize(text_embeds, dim=-1)
+
+    def encode_image(self, pixel_values):
+        """Image encoding with output normalization
+        Args:
+            pixel_values: [b, n, c, h, w] image tensor
+            """
+        if len(pixel_values.shape) == 4:  # this is of shape b, c, h, w
+            pixel_values = pixel_values.unsqueeze(1)  # add n dim
+        # Get vision encoder output (CLS token)
+        image_embeds = self.base_model.forward_vision(
+            pixel_values,
+            classify=False
+        )
+        return F.normalize(image_embeds, dim=-1)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -190,30 +242,30 @@ class MAEContrastiveWrapper(nn.Module):
                 elif 'bias' in name:
                     nn.init.constant_(param, 0)
 
-    def encode_text(self, input_ids, attention_mask):
-        text_outputs = self.text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-        # Get all hidden states instead of just [CLS]
-        hidden_states = text_outputs.last_hidden_state
+    def random_masking(self, x, mask_ratio):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L, D = x.shape
+        len_keep = int(L * (1 - mask_ratio))
 
-        # Apply attention pooling
-        text_embeds = self.text_projection(hidden_states)
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        return F.normalize(text_embeds, dim=-1)
+        # Keep the first len_keep tokens
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1,
+                                index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
-    def encode_image(self, pixel_values):
-        # Get vision encoder output (CLS token)
-        image_embeds = self.encoder.forward_vision(
-            pixel_values
-        )
-        return F.normalize(image_embeds, dim=-1)
+        return x_masked, ids_restore
 
-    def forward(self, pixel_values, input_ids, attention_mask):
-        batch_size = pixel_values.shape[0]
-
+    def forward(self, pixel_values, input_ids, attention_mask, negative_input_ids=None, negative_attention_mask=None):
+        """
+        Forward pass with support for negative samples
+        """
         # MAE forward pass
         x = self.encoder(pixel_values, output_hidden_states=True).last_hidden_state[:, 1:, :]
         x, self.ids_restore = self.random_masking(x, self.mask_ratio)
@@ -223,45 +275,66 @@ class MAEContrastiveWrapper(nn.Module):
         image_embeds = self.encode_image(pixel_values)
         text_embeds = self.encode_text(input_ids, attention_mask)
 
-        return mae_pred, image_embeds, text_embeds
+        # Encode negative examples if provided
+        if negative_input_ids is not None:
+            negative_embeds = self.encode_text(negative_input_ids, negative_attention_mask)
+        else:
+            negative_embeds = None
 
-    def get_contrastive_loss(self, image_embeds, text_embeds):
-        # Cosine similarity as logits
-        logits = torch.matmul(image_embeds, text_embeds.t()) / self.temperature
+        return mae_pred, image_embeds, text_embeds, negative_embeds
 
-        # Symmetric loss
-        labels = torch.arange(len(image_embeds), device=image_embeds.device)
-        loss_i2t = F.cross_entropy(logits, labels)
-        loss_t2i = F.cross_entropy(logits.t(), labels)
+    def get_contrastive_loss(self, image_embeds, positive_text_embeds, negative_text_embeds=None):
+        """
+        Compute contrastive loss with positive and negative pairs.
+        Args:
+            image_embeds: [batch_size, embed_dim]
+            positive_text_embeds: [batch_size, embed_dim]
+            negative_text_embeds: Optional [batch_size, embed_dim] for explicit negatives
+        """
+        batch_size = image_embeds.size(0)
 
-        return (loss_i2t + loss_t2i) / 2
+        # Scale logits by learned temperature
+        logit_scale = self.logit_scale.exp()
+        text_embeds_all = positive_text_embeds
+        neg_embeds_all = negative_text_embeds
 
-    def get_loss(self, mae_pred, pixel_values, image_embeds, text_embeds):
+        # Compute similarity matrices
+        logits_per_image = logit_scale * image_embeds @ text_embeds_all.t()
+        logits_per_text = logits_per_image.t()
+
+        # Create labels with label smoothing
+        labels = torch.arange(batch_size, device=logits_per_image.device)
+        soft_targets = torch.zeros_like(logits_per_image)
+        soft_targets.scatter_(1, labels.view(-1, 1), 1)
+        soft_targets = soft_targets * (1 - self.label_smoothing) + self.label_smoothing / batch_size
+
+        # Compute losses
+        loss_i2t = -torch.sum(soft_targets * F.log_softmax(logits_per_image, dim=1), dim=1).mean()
+        loss_t2i = -torch.sum(soft_targets * F.log_softmax(logits_per_text, dim=1), dim=1).mean()
+
+        # If explicit negatives provided, add hard negative loss
+        if negative_text_embeds is not None:
+            neg_logits = logit_scale * image_embeds @ neg_embeds_all.t()
+            # Push negative pairs apart
+            neg_loss = F.softplus(neg_logits).mean()
+            contrastive_loss = (loss_i2t + loss_t2i) / 2 + 0.1 * neg_loss
+        else:
+            contrastive_loss = (loss_i2t + loss_t2i) / 2
+
+        return contrastive_loss
+
+    def get_loss(self, mae_pred, pixel_values, image_embeds, text_embeds, negative_embeds=None):
         # MAE reconstruction loss
         target = patchify(pixel_values)
         mae_loss = F.mse_loss(mae_pred, target)
 
-        # Contrastive loss
-        contrastive_loss = self.get_contrastive_loss(image_embeds, text_embeds)
+        # Contrastive loss with support for negatives
+        contrastive_loss = self.get_contrastive_loss(image_embeds, text_embeds, negative_embeds)
 
         # Combined loss
         total_loss = (1 - self.contrastive_weight) * mae_loss + self.contrastive_weight * contrastive_loss
 
         return total_loss, mae_loss, contrastive_loss
-
-    def random_masking(self, x, mask_ratio):
-        """Keep the random_masking method from the original MAEPretrainingWrapper"""
-        N, L, D = x.shape
-        len_keep = int(L * (1 - mask_ratio))
-
-        noise = torch.rand(N, L, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-
-        return x_masked, ids_restore
 
 
 def calculate_multilabel_metrics(y_true, y_pred, threshold=0.5):
@@ -664,19 +737,9 @@ class PretrainingDataset(Dataset):
             ])
             grid = resize_transform(grid)
 
-        # Tokenize caption
-        tokenized = self.tokenizer(
-            caption,
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-
         return {
             'pixel_values': grid,
-            'input_ids': tokenized.input_ids.squeeze(0),
-            'attention_mask': tokenized.attention_mask.squeeze(0),
+            'caption': caption,
             'num_images': len(images),
             'is_video': is_video
         }
@@ -686,11 +749,11 @@ def train(
         model_path: str,
         output_path: str,
         meta_train_path: str,
+        meta_val_path: str,
         lr: float = 1.5e-4,
         weight_decay: float = 0.05,
         batch_size: int = 64,
         epochs: int = 100,
-        warmup_epochs: int = 10,
         mask_ratio: float = 0.75,
         temperature: float = 0.07,
         contrastive_weight: float = 0.5
@@ -707,13 +770,38 @@ def train(
     file_handler.setFormatter(formatter)
 
     # Load base model
-    base_model = InternVLChatModel.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16
-    )
+    # base_model = InternVLChatModel.from_pretrained(
+    #     model_path,
+    #     torch_dtype=torch.bfloat16
+    # )
+
+    if 'sbb2' in model_path.lower():
+        base_model = ViTSBBClassifier(vision_output_size=1).cuda()
+        # model = model.to(torch.bfloat16)
+    elif 'convnext' in model_path.lower():
+        base_model = ConvNextV2Classifier.from_pretrained(
+            model_path,  # or any other ConvNeXtV2 checkpoint
+            vision_output_size=1
+        ).cuda()
+        base_model = base_model.to(torch.bfloat16)
+    elif 'clip' in model_path.lower():
+        base_model = OpenCLIPClassifier.from_pretrained(
+            model_path,
+            vision_output_size=1,
+            dtype=torch.bfloat16
+        ).cuda()
+    elif 'eva' in model_path.lower():
+        base_model = EVA02Classifier(
+            vision_output_size=1,
+            checkpoint_path="eva02_L_pt_m38m_medft_in21k_ft_in1k_p14.pt"
+        ).cuda()
+        base_model = base_model.to(torch.bfloat16)
+    else:
+        base_model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=1,
+                                                  torch_dtype=torch.bfloat16)
 
     # Create MAE + Contrastive model
-    model = MAEContrastiveWrapper(
+    model: MAEContrastiveWrapper = MAEContrastiveWrapper(
         base_model=base_model,
         mask_ratio=mask_ratio,
         temperature=temperature,
@@ -723,27 +811,78 @@ def train(
     model = model.cuda()
 
     # Create tokenizer for text encoding
-    tokenizer = base_model.text_tokenizer
+    tokenizer = model.tokenizer
 
     # Create dataset and dataloader
     dataset = PretrainingDataset(meta_train_path, tokenizer)
-    dataloader = DataLoader(
+    val_dataset = PretrainingDataset(meta_val_path, tokenizer, is_train=False)
+    # Optimizer and scheduler setup remains the same
+    param_groups = [
+        {'params': [p for n, p in model.named_parameters() if p.requires_grad]}
+    ]
+
+    def collate_with_negatives(batch, tokenizer):
+        pixel_values = torch.stack([item['pixel_values'] for item in batch])
+
+        # Get positive captions
+        pos_texts = [item['caption'] for item in batch]
+
+        # Sample negative captions for each item
+        neg_texts = []
+        for _ in range(len(batch)):
+            # Sample a different caption from the dataset's unique captions
+            while True:
+                neg = random.choice(dataset.unique_captions)
+                if neg not in pos_texts:  # Ensure it's not the positive caption
+                    neg_texts.append(neg)
+                    break
+
+        # Tokenize positive and negative captions
+        pos_tokens = tokenizer(
+            pos_texts,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        )
+
+        neg_tokens = tokenizer(
+            neg_texts,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        )
+
+        return {
+            'pixel_values': pixel_values,
+            'input_ids': pos_tokens.input_ids,
+            'attention_mask': pos_tokens.attention_mask,
+            'negative_input_ids': neg_tokens.input_ids,
+            'negative_attention_mask': neg_tokens.attention_mask
+        }
+
+    train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=32,
         pin_memory=True,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer)  # Custom collate function needed
+        collate_fn=lambda batch: collate_with_negatives(batch, model.tokenizer)
     )
 
-    # Optimizer and scheduler setup remains the same
-    param_groups = [
-        {'params': [p for n, p in model.named_parameters() if p.requires_grad]}
-    ]
-    optimizer = SOAP(param_groups, lr=lr, weight_decay=weight_decay)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=32,
+        pin_memory=True,
+        collate_fn=lambda batch: collate_with_negatives(batch, model.tokenizer)
+    )
 
-    iters_per_epoch = len(dataloader)
-    warmup_iters = warmup_epochs * iters_per_epoch
+    optimizer = SOAP(param_groups, lr=lr, weight_decay=weight_decay)
+    warmup_iters = 500
+    iters_per_epoch = len(train_loader)
     total_iters = epochs * iters_per_epoch
 
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -758,39 +897,60 @@ def train(
     for epoch in range(epochs):
         model.train()
 
-        for batch in tqdm.tqdm(dataloader, desc=f'Epoch {epoch}'):
+        for batch in tqdm.tqdm(train_loader, desc=f'Epoch {epoch}'):
             pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
             input_ids = batch['input_ids'].cuda()
             attention_mask = batch['attention_mask'].cuda()
+            neg_input_ids = batch['negative_input_ids'].cuda()
+            neg_attention_mask = batch['negative_attention_mask'].cuda()
 
-            # Forward pass
-            mae_pred, image_embeds, text_embeds = model(pixel_values, input_ids, attention_mask)
-            total_loss, mae_loss, contrastive_loss = model.get_loss(
-                mae_pred, pixel_values, image_embeds, text_embeds
+            # Forward pass with negative samples
+            mae_pred, image_embeds, text_embeds, negative_embeds = model(
+                pixel_values,
+                input_ids,
+                attention_mask,
+                neg_input_ids,
+                neg_attention_mask
             )
 
-            # Backward pass
+            # Compute loss
+            total_loss, mae_loss, contrastive_loss = model.get_loss(
+                mae_pred,
+                pixel_values,
+                image_embeds,
+                text_embeds,
+                negative_embeds
+            )
+
+            # Rest of training loop (backward pass, optimizer step, etc.)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
             lr_scheduler.step()
 
-            # Log metrics
-            stats = {
-                'total_loss': total_loss.item(),
-                'mae_loss': mae_loss.item(),
-                'contrastive_loss': contrastive_loss.item(),
-                'lr': optimizer.param_groups[0]['lr'],
-                'step': step,
-                'epoch': epoch
-            }
-            wandb.log(stats)
+            # Log additional metrics
+            with torch.no_grad():
+                # Calculate image-text similarity for positives
+                pos_sim = F.cosine_similarity(image_embeds, text_embeds).mean()
+                # Calculate image-text similarity for negatives
+                neg_sim = F.cosine_similarity(image_embeds, negative_embeds).mean()
 
-            if step % 100 == 0:
-                logger.info(f'Step {step}: {stats}')
+                stats = {
+                    'total_loss': total_loss.item(),
+                    'mae_loss': mae_loss.item(),
+                    'contrastive_loss': contrastive_loss.item(),
+                    'positive_similarity': pos_sim.item(),
+                    'negative_similarity': neg_sim.item(),
+                    'logit_scale': model.logit_scale.exp().item(),
+                    'lr': optimizer.param_groups[0]['lr'],
+                    'step': step,
+                    'epoch': epoch
+                }
+                wandb.log(stats)
 
-            # Checkpoint saving logic remains the same
-            if step % 1000 == 0:
+            # Evaluation and checkpointing
+            if step % 1000 == 0 and step > 0:
+                # Save checkpoint
                 torch.save(
                     {
                         'model': model.state_dict(),
@@ -800,6 +960,17 @@ def train(
                         'step': step,
                     },
                     os.path.join(output_path, f'checkpoint_{step}.pt')
+                )
+                # Run zero-shot evaluation
+                evaluate_zero_shot(
+                    model,
+                    val_dataset,
+                    model.device,
+                    'val',
+                    batch_size,
+                    step,
+                    epoch,
+                    dataloader=val_loader
                 )
 
             step += 1
@@ -822,7 +993,7 @@ def collate_fn(batch, tokenizer):
     return {
         'pixel_values': pixel_values,
         'input_ids': tokenized.input_ids,
-        'attention_mask': tokenized.attention_mask
+        'text_attention_mask': tokenized.attention_mask
     }
 
 
@@ -865,21 +1036,19 @@ if __name__ == '__main__':
                         help='Ratio of patches to mask')
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size for training')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01,
                         help='Weight decay')
-    parser.add_argument('--epochs', type=int, default=10,
+    parser.add_argument('--epochs', type=int, default=5,
                         help='Number of epochs to train')
-    parser.add_argument('--warmup_epochs', type=int, default=1,
-                        help='Number of warmup epochs')
 
     # Data parameters
-    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json',
+    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_pretrain.json',
                         help='Path to training metadata')
-    parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_valid.json',
+    parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_pretrain_valid.json',
                         help='Path to training metadata')
 
     # Output parameters
@@ -900,10 +1069,10 @@ if __name__ == '__main__':
         model_path=args.model_path,
         output_path=args.output_path,
         meta_train_path=args.meta_train_path,
+        meta_val_path=args.meta_valid_path,
         lr=args.lr,
         weight_decay=args.weight_decay,
         batch_size=args.batch_size,
         epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs,
         mask_ratio=args.mask_ratio
     )
