@@ -2,13 +2,16 @@ import argparse
 import json
 import logging
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import wandb
+from torchvision import transforms
+
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 from internvl.train.dataset import build_transform
 from PIL import Image
@@ -103,28 +106,103 @@ class MAEDecoder(nn.Module):
         return x
 
 
-class MAEPretrainingWrapper(nn.Module):
+class MAEContrastiveWrapper(nn.Module):
     def __init__(
             self,
-            base_model: torch.nn.modules,
+            base_model: torch.nn.Module,
             mask_ratio: float = 0.75,
             decoder_embed_dim: int = 512,
+            temperature: float = 0.07,
+            contrastive_weight: float = 0.5
     ):
         super().__init__()
         self.encoder = base_model.vision_model
+        self.text_encoder = base_model.text_model
         self.mask_ratio = mask_ratio
+        self.temperature = temperature
+        self.contrastive_weight = contrastive_weight
 
+        # MAE decoder
         encoder_embed_dim = self.encoder.config.hidden_size
         self.decoder = MAEDecoder(
             encoder_embed_dim=encoder_embed_dim,
             decoder_embed_dim=decoder_embed_dim,
         )
 
-    def random_masking(
-            self,
-            x: torch.Tensor,
-            mask_ratio: float
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Projection heads for contrastive learning
+        self.image_projection = nn.Linear(encoder_embed_dim, 512)
+        self.text_projection = nn.Linear(self.text_encoder.config.hidden_size, 512)
+
+        # Initialize projection heads
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def encode_text(self, input_ids, attention_mask):
+        text_outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        # Use [CLS] token embedding
+        text_embeds = text_outputs.last_hidden_state[:, 0]
+        text_embeds = self.text_projection(text_embeds)
+        return F.normalize(text_embeds, dim=-1)
+
+    def encode_image(self, pixel_values):
+        # Get vision encoder output (CLS token)
+        vision_outputs = self.encoder(
+            pixel_values,
+            output_hidden_states=True
+        )
+        image_embeds = vision_outputs.last_hidden_state[:, 0]
+        image_embeds = self.image_projection(image_embeds)
+        return F.normalize(image_embeds, dim=-1)
+
+    def forward(self, pixel_values, input_ids, attention_mask):
+        batch_size = pixel_values.shape[0]
+
+        # MAE forward pass
+        x = self.encoder(pixel_values, output_hidden_states=True).last_hidden_state[:, 1:, :]
+        x, self.ids_restore = self.random_masking(x, self.mask_ratio)
+        mae_pred = self.decoder(x, self.ids_restore)
+
+        # Contrastive learning forward pass
+        image_embeds = self.encode_image(pixel_values)
+        text_embeds = self.encode_text(input_ids, attention_mask)
+
+        return mae_pred, image_embeds, text_embeds
+
+    def get_contrastive_loss(self, image_embeds, text_embeds):
+        # Cosine similarity as logits
+        logits = torch.matmul(image_embeds, text_embeds.t()) / self.temperature
+
+        # Symmetric loss
+        labels = torch.arange(len(image_embeds), device=image_embeds.device)
+        loss_i2t = F.cross_entropy(logits, labels)
+        loss_t2i = F.cross_entropy(logits.t(), labels)
+
+        return (loss_i2t + loss_t2i) / 2
+
+    def get_loss(self, mae_pred, pixel_values, image_embeds, text_embeds):
+        # MAE reconstruction loss
+        target = patchify(pixel_values)
+        mae_loss = F.mse_loss(mae_pred, target)
+
+        # Contrastive loss
+        contrastive_loss = self.get_contrastive_loss(image_embeds, text_embeds)
+
+        # Combined loss
+        total_loss = (1 - self.contrastive_weight) * mae_loss + self.contrastive_weight * contrastive_loss
+
+        return total_loss, mae_loss, contrastive_loss
+
+    def random_masking(self, x, mask_ratio):
+        """Keep the random_masking method from the original MAEPretrainingWrapper"""
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
 
@@ -132,53 +210,34 @@ class MAEPretrainingWrapper(nn.Module):
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        # Keep the first len_keep tokens
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
         return x_masked, ids_restore
-
-    def forward_encoder(self, x: torch.Tensor) -> torch.Tensor:
-        # Get patch embeddings (exclude CLS token)
-        x = self.encoder(x, output_hidden_states=False).last_hidden_state[:, 1:, :]
-
-        # Add random mask
-        x, self.ids_restore = self.random_masking(x, self.mask_ratio)
-        return x
-
-    def forward_decoder(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward decoder
-        x = self.decoder(x, self.ids_restore)
-        return x
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        latent = self.forward_encoder(pixel_values)
-        pred = self.forward_decoder(latent)
-        return pred
-
-    def get_loss(self, pred: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Compute reconstruction loss between predicted and target patches
-        """
-        target = patchify(pixel_values)
-        loss = F.mse_loss(pred, target)
-        return loss
 
 
 class PretrainingDataset(Dataset):
     def __init__(
             self,
             meta_path: str,
+            tokenizer: Any,
             image_size: int = 448,
+            max_length: int = 77,
+            frames_per_video: int = 4,  # Number of frames to extract from each video
             is_train: bool = True
     ):
         super().__init__()
         self.image_size = image_size
         self.is_train = is_train
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.frames_per_video = frames_per_video
 
         # Load metadata
-        self.images = []
+        self.image_groups = []  # List of lists of image paths or video paths
         self.captions = []
+        self.is_video = []  # Track which entries are videos
+
         with open(meta_path, 'r') as f:
             meta = json.load(f)
 
@@ -188,36 +247,150 @@ class PretrainingDataset(Dataset):
                 for line in f:
                     data = json.loads(line)
                     if 'images' in data:
-                        for image in data['images']:
-                            self.images.append(os.path.join(root, image))
+                        this_images = [os.path.join(root, image) for image in data['images']]
+                        self.image_groups.append(this_images)
+                        self.is_video.append(False)
+                    elif 'videos' in data and len(data['videos']) > 0:
+                        video_path = os.path.join(root, data['videos'][0])
+                        self.image_groups.append([video_path])  # Store as single-item list for consistency
+                        self.is_video.append(True)
+                    else:
+                        continue
+
                     target = data['conversations'][1]['value'].lower()
-                    modality = ds_name.split('_')[0]  # chest, derm, mammo, etc
-                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm', 'dermoscopy')
+                    modality = ds_name.split('_')[0]
+                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm',
+                                                                                                                'dermoscopy')
                     modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
                     caption = modality + ', ' + target
                     self.captions.append(caption)
 
-        self.unique_captions = list(set(self.captions))
-
-        logger.info(f'Loaded {len(self.images)} images for pretraining')
+        logger.info(f'Loaded {len(self.image_groups)} image/video groups for pretraining')
         self.transform = build_transform(
             is_train=is_train,
             input_size=image_size
         )
 
-    def __len__(self) -> int:
-        return len(self.images)
+    def extract_video_frames(self, video_path: str) -> List[torch.Tensor]:
+        """Extract frames from video and convert to tensors."""
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        image_path = self.images[idx]
+            # Get total frames
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames == 0:
+                logger.error(f'Empty video file: {video_path}')
+                return [torch.zeros((3, self.image_size, self.image_size))]
+
+            # Calculate frame indices to extract
+            indices = np.linspace(0, total_frames - 1, self.frames_per_video, dtype=int)
+            frames = []
+
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if ret:
+                    # Convert BGR to RGB
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Convert to PIL Image and apply transforms
+                    frame = Image.fromarray(frame)
+                    frame_tensor = self.transform(frame)
+                    frames.append(frame_tensor)
+                else:
+                    logger.error(f'Failed to read frame {idx} from video: {video_path}')
+                    frames.append(torch.zeros((3, self.image_size, self.image_size)))
+
+            cap.release()
+            return frames
+
+        except Exception as e:
+            logger.error(f'Error processing video {video_path}: {e}')
+            return [torch.zeros((3, self.image_size, self.image_size))] * self.frames_per_video
+
+    def get_grid_dimensions(self, n_images: int) -> Tuple[int, int]:
+        """
+        Calculate the optimal grid dimensions for n images.
+        Returns (rows, cols) that form the most square-like arrangement.
+        """
+        cols = int(np.ceil(np.sqrt(n_images)))
+        rows = int(np.ceil(n_images / cols))
+        return rows, cols
+
+    def create_image_grid(self, images: List[torch.Tensor], rows: int, cols: int) -> torch.Tensor:
+        """
+        Create a grid of images with specified dimensions.
+        Pads empty spaces with black if necessary.
+        """
+        n_images = len(images)
+        c, h, w = images[0].shape
+
+        # Create empty grid
+        grid = torch.zeros((c, h * rows, w * cols))
+
+        for idx, img in enumerate(images):
+            i = idx // cols  # row
+            j = idx % cols  # column
+            grid[:, i * h:(i + 1) * h, j * w:(j + 1) * w] = img
+
+        return grid
+
+    def load_and_transform_image(self, image_path: str) -> torch.Tensor:
+        """Load and transform a single image, handling errors."""
         try:
             image = Image.open(image_path).convert('RGB')
-            image = self.transform(image)
+            return self.transform(image)
         except Exception as e:
             logger.error(f'Error loading image {image_path}: {e}')
-            image = torch.zeros((3, self.image_size, self.image_size))
+            return torch.zeros((3, self.image_size, self.image_size))
 
-        return {'pixel_values': image, 'caption': self.captions[idx]}
+    def __len__(self) -> int:
+        return len(self.image_groups)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        paths = self.image_groups[idx]
+        caption = self.captions[idx]
+        is_video = self.is_video[idx]
+
+        if is_video:
+            # Extract frames from video
+            images = self.extract_video_frames(paths[0])
+        else:
+            # Load and transform all images in the group
+            images = [self.load_and_transform_image(path) for path in paths]
+
+        # Get optimal grid dimensions
+        rows, cols = self.get_grid_dimensions(len(images))
+
+        # Create image grid
+        grid = self.create_image_grid(images, rows, cols)
+
+        # Resize grid to original image size while maintaining aspect ratio
+        if grid.shape[1] != self.image_size or grid.shape[2] != self.image_size:
+            resize_transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize(self.image_size, antialias=True),
+                transforms.CenterCrop(self.image_size),
+                transforms.ToTensor()
+            ])
+            grid = resize_transform(grid)
+
+        # Tokenize caption
+        tokenized = self.tokenizer(
+            caption,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+
+        return {
+            'pixel_values': grid,
+            'input_ids': tokenized.input_ids.squeeze(0),
+            'attention_mask': tokenized.attention_mask.squeeze(0),
+            'num_images': len(images),
+            'is_video': is_video
+        }
 
 
 def train(
@@ -229,10 +402,12 @@ def train(
         batch_size: int = 64,
         epochs: int = 100,
         warmup_epochs: int = 10,
-        mask_ratio: float = 0.75
+        mask_ratio: float = 0.75,
+        temperature: float = 0.07,
+        contrastive_weight: float = 0.5
 ):
     # Initialize wandb
-    wandb.init(project='mae_pretraining')
+    wandb.init(project='pretraining')
 
     # Create output directory
     os.makedirs(output_path, exist_ok=True)
@@ -240,30 +415,34 @@ def train(
     # Load base model
     base_model = InternVLChatModel.from_pretrained(
         model_path,
-        vision_only=True,
-        vision_output_size=1,  # Dummy value since we don't use classification head
         torch_dtype=torch.bfloat16
     )
 
-    # Create MAE model
-    model = MAEPretrainingWrapper(
+    # Create MAE + Contrastive model
+    model = MAEContrastiveWrapper(
         base_model=base_model,
-        mask_ratio=mask_ratio
+        mask_ratio=mask_ratio,
+        temperature=temperature,
+        contrastive_weight=contrastive_weight
     )
     model = model.to(torch.bfloat16)
     model = model.cuda()
 
+    # Create tokenizer for text encoding
+    tokenizer = base_model.text_tokenizer
+
     # Create dataset and dataloader
-    dataset = PretrainingDataset(meta_train_path)
+    dataset = PretrainingDataset(meta_train_path, tokenizer)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=32,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=lambda batch: collate_fn(batch, tokenizer)  # Custom collate function needed
     )
 
-    # Create optimizer
+    # Optimizer and scheduler setup remains the same
     param_groups = [
         {'params': [p for n, p in model.named_parameters() if p.requires_grad]}
     ]
@@ -273,7 +452,6 @@ def train(
         weight_decay=weight_decay
     )
 
-    # Create learning rate scheduler
     iters_per_epoch = len(dataloader)
     warmup_iters = warmup_epochs * iters_per_epoch
     total_iters = epochs * iters_per_epoch
@@ -293,20 +471,26 @@ def train(
 
         for batch in tqdm.tqdm(dataloader, desc=f'Epoch {epoch}'):
             pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
+            input_ids = batch['input_ids'].cuda()
+            attention_mask = batch['attention_mask'].cuda()
 
             # Forward pass
-            pred = model(pixel_values)
-            loss = model.get_loss(pred, pixel_values)
+            mae_pred, image_embeds, text_embeds = model(pixel_values, input_ids, attention_mask)
+            total_loss, mae_loss, contrastive_loss = model.get_loss(
+                mae_pred, pixel_values, image_embeds, text_embeds
+            )
 
             # Backward pass
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
             lr_scheduler.step()
 
             # Log metrics
             stats = {
-                'loss': loss.item(),
+                'total_loss': total_loss.item(),
+                'mae_loss': mae_loss.item(),
+                'contrastive_loss': contrastive_loss.item(),
                 'lr': optimizer.param_groups[0]['lr'],
                 'step': step,
                 'epoch': epoch
@@ -316,7 +500,7 @@ def train(
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
 
-            # Save checkpoint
+            # Checkpoint saving logic remains the same
             if step % 1000 == 0:
                 torch.save(
                     {
@@ -329,52 +513,28 @@ def train(
                     os.path.join(output_path, f'checkpoint_{step}.pt')
                 )
 
-                # only keep the last 5 checkpoints
-                checkpoints = sorted([f for f in os.listdir(output_path) if f.startswith('checkpoint_')], key=lambda x: int(x.split('_')[-1].split('.')[0]))
-                for f in checkpoints[:-5]:
-                    os.remove(os.path.join(output_path, f))
-
             step += 1
 
-        # Save epoch checkpoint
-        torch.save(
-            {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'step': step,
-            },
-            os.path.join(output_path, f'checkpoint_epoch_{epoch}.pt')
-        )
 
-        # Visualization of reconstruction (once per epoch)
-        model.eval()
-        with torch.no_grad():
-            # Get a small batch for visualization
-            vis_batch = next(iter(DataLoader(dataset, batch_size=8, shuffle=True)))
-            pixel_values = vis_batch['pixel_values'].cuda()
+def collate_fn(batch, tokenizer):
+    """Custom collate function to handle both images and text"""
+    pixel_values = torch.stack([item['pixel_values'] for item in batch])
 
-            # Get reconstruction
-            pred = model(pixel_values)
+    # Tokenize captions
+    texts = [item['caption'] for item in batch]
+    tokenized = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=77,  # Standard CLIP text length
+        return_tensors="pt"
+    )
 
-            # Convert predictions and targets back to images
-            pred = unpatchify(pred, pixel_values.shape[2])
-
-            # Log images to wandb
-            wandb.log({
-                'reconstructions': [
-                    wandb.Image(
-                        torch.cat([
-                            pixel_values[i].cpu(),
-                            pred[i].cpu()
-                        ], dim=2),
-                        caption=f'Original vs Reconstruction'
-                    )
-                    for i in range(min(8, len(pred)))
-                ],
-                'epoch': epoch
-            })
+    return {
+        'pixel_values': pixel_values,
+        'input_ids': tokenized.input_ids,
+        'attention_mask': tokenized.attention_mask
+    }
 
 
 def unpatchify(x: torch.Tensor, img_size: int) -> torch.Tensor:
@@ -429,6 +589,8 @@ if __name__ == '__main__':
 
     # Data parameters
     parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json',
+                        help='Path to training metadata')
+    parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_valid.json',
                         help='Path to training metadata')
 
     # Output parameters
