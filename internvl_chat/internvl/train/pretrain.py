@@ -1,8 +1,11 @@
 import argparse
 import json
 import logging
+import math
 import os
-from typing import Dict, Tuple, Any, List
+import random
+from collections import defaultdict
+from typing import Dict, Tuple, Any, List, Optional
 
 import numpy as np
 import torch
@@ -10,12 +13,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import wandb
+from sklearn.metrics import roc_auc_score, confusion_matrix
 from torchvision import transforms
+from transformers import get_cosine_schedule_with_warmup
 
-from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
+from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel, AttentionPoolingBlock
 from internvl.train.dataset import build_transform
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
+from functools import partial
+from .soap import SOAP
 
 from internvl.train.pretrain_utils import get_2d_sincos_pos_embed, patchify
 
@@ -129,12 +136,36 @@ class MAEContrastiveWrapper(nn.Module):
             decoder_embed_dim=decoder_embed_dim,
         )
 
-        # Projection heads for contrastive learning
-        self.image_projection = nn.Linear(encoder_embed_dim, 512)
-        self.text_projection = nn.Linear(self.text_encoder.config.hidden_size, 512)
+        # Determine output dimension by running a sample forward pass
+        with torch.no_grad():
+            # Create a blank image tensor with correct dimensions
+            dummy_image = torch.zeros(1, 3,
+                                      self.encoder.config.image_size,
+                                      self.encoder.config.image_size)
+            # Move to same device and dtype as encoder
+            dummy_image = dummy_image.to(
+                device=next(self.encoder.parameters()).device,
+                dtype=next(self.encoder.parameters()).dtype
+            )
+            # Get output size from image encoder
+            out_dim = self.encoder.forward_vision(dummy_image).shape[-1]
+            logger.info(f"Detected vision encoder output dimension: {out_dim}")
 
-        # Initialize projection heads
+        # Text projection with matched output dimension
+        self.text_projection = AttentionPoolingBlock(
+            dim=self.text_encoder.config.hidden_size,
+            num_heads=8,
+            qkv_bias=True,
+            qk_scale=None,
+            drop=0.,
+            attn_drop=0.,
+            norm_layer=partial(nn.LayerNorm, eps=1e-5),
+            out_dim=out_dim  # Use detected dimension
+        )
+
+        # Initialize weights
         self.apply(self._init_weights)
+        self._init_attention_pool()
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -142,25 +173,42 @@ class MAEContrastiveWrapper(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
+    def _init_attention_pool(self):
+        """Initialize the attention pooling parameters."""
+        for name, param in self.text_projection.named_parameters():
+            if 'q' in name:
+                nn.init.trunc_normal_(param, std=0.02)
+            elif 'k' in name or 'v' in name:
+                nn.init.trunc_normal_(param, std=0.02)
+            elif 'proj' in name:
+                nn.init.trunc_normal_(param, std=0.02)
+                if 'bias' in name:
+                    nn.init.constant_(param, 0)
+            elif 'norm' in name:
+                if 'weight' in name:
+                    nn.init.constant_(param, 1.0)
+                elif 'bias' in name:
+                    nn.init.constant_(param, 0)
+
     def encode_text(self, input_ids, attention_mask):
         text_outputs = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True
         )
-        # Use [CLS] token embedding
-        text_embeds = text_outputs.last_hidden_state[:, 0]
-        text_embeds = self.text_projection(text_embeds)
+        # Get all hidden states instead of just [CLS]
+        hidden_states = text_outputs.last_hidden_state
+
+        # Apply attention pooling
+        text_embeds = self.text_projection(hidden_states)
+
         return F.normalize(text_embeds, dim=-1)
 
     def encode_image(self, pixel_values):
         # Get vision encoder output (CLS token)
-        vision_outputs = self.encoder(
-            pixel_values,
-            output_hidden_states=True
+        image_embeds = self.encoder.forward_vision(
+            pixel_values
         )
-        image_embeds = vision_outputs.last_hidden_state[:, 0]
-        image_embeds = self.image_projection(image_embeds)
         return F.normalize(image_embeds, dim=-1)
 
     def forward(self, pixel_values, input_ids, attention_mask):
@@ -216,6 +264,245 @@ class MAEContrastiveWrapper(nn.Module):
         return x_masked, ids_restore
 
 
+def calculate_multilabel_metrics(y_true, y_pred, threshold=0.5):
+    """
+    Calculate sensitivity (recall) and specificity for multilabel classification.
+
+    Parameters:
+    y_true: numpy array of shape (n_samples, n_classes) with true binary labels
+    y_pred: numpy array of shape (n_samples, n_classes) with predicted probabilities
+    threshold: float, classification threshold (default 0.5)
+
+    Returns:
+    sensitivity, specificity (macro-averaged across classes)
+    """
+    n_classes = y_true.shape[1]
+
+    # Convert probabilities to binary predictions
+    y_pred_binary = (y_pred >= threshold).astype(int)
+
+    # Initialize metrics storage
+    sensitivities = []
+    specificities = []
+
+    # Calculate metrics for each class
+    for i in range(n_classes):
+        tn, fp, fn, tp = confusion_matrix(y_true[:, i], y_pred_binary[:, i]).ravel()
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        sensitivities.append(sensitivity)
+        specificities.append(specificity)
+
+    # Calculate macro-averaged metrics
+    sensitivity = np.mean(sensitivities)
+    specificity = np.mean(specificities)
+
+    return sensitivity, specificity
+
+
+def evaluate_zero_shot(
+        model,
+        dataset,
+        device,
+        split: str,
+        batch_size: int,
+        step: int,
+        epoch: int,
+        num_samples: int = -1,
+        dataloader: Optional[DataLoader] = None
+) -> Dict:
+    """
+    Zero-shot evaluation using contrastive text-image matching.
+    """
+    model.eval()
+    dataset_outputs = defaultdict(list)
+    dataset_labels = defaultdict(list)
+    dataset_gt_similarities = defaultdict(list)
+
+    # First, encode all unique captions
+    unique_captions = dataset.unique_captions
+    caption_to_idx = {caption: idx for idx, caption in enumerate(unique_captions)}
+
+    all_text_features = []
+    logger.info("Encoding all unique captions...")
+    for i in range(0, len(unique_captions), batch_size):
+        batch_captions = unique_captions[i:i + batch_size]
+        tokenized = model.tokenizer(
+            batch_captions,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad():
+            text_features = model.encode_text(
+                tokenized.input_ids,
+                tokenized.attention_mask
+            )
+        all_text_features.append(text_features)
+
+    all_text_features = torch.cat(all_text_features, dim=0)
+
+    # Create dataloader if not provided
+    if dataloader is None:
+        if len(dataset) > num_samples > 0:
+            subset_indices = random.sample(range(len(dataset)), num_samples)
+            subset = Subset(dataset, subset_indices)
+        else:
+            subset = dataset
+
+        dataloader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=32,
+            pin_memory=True
+        )
+
+    # Evaluate images
+    with torch.no_grad():
+        num_batches = len(dataloader)
+        if num_samples > 0:
+            num_batches = math.ceil(num_samples / batch_size)
+
+        bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}', total=num_batches)
+
+        for index, batch in enumerate(bar):
+            pixel_values = batch['pixel_values'].to(device)
+            datasets = batch['dataset']
+            labels = batch['labels'].to(device)
+            captions = batch.get('caption', None)
+
+            # Get image embeddings
+            image_features = model.encode_image(pixel_values)
+
+            # Calculate similarity scores with all captions
+            similarity = image_features @ all_text_features.T
+
+            # Convert to probabilities
+            probs = F.softmax(similarity / model.temperature, dim=-1)
+
+            # Calculate ground truth similarities if captions are available
+            if captions is not None:
+                gt_indices = torch.tensor([caption_to_idx[cap] for cap in captions], device=device)
+                gt_text_features = all_text_features[gt_indices]
+                gt_similarities = F.cosine_similarity(image_features, gt_text_features)
+            else:
+                gt_similarities = torch.zeros(len(pixel_values), device=device)
+
+            # Store outputs, labels, and ground truth similarities by dataset
+            for prob, label, gt_sim, ds in zip(probs, labels, gt_similarities, datasets):
+                dataset_outputs[ds].append(prob.cpu())
+                dataset_labels[ds].append(label.cpu().numpy())
+                dataset_gt_similarities[ds].append(gt_sim.cpu().item())
+
+            if num_samples > 0 and index >= num_batches:
+                break
+
+    # Calculate metrics by dataset and modality
+    overall_stats = {
+        'auc': [],
+        'sensitivity': [],
+        'specificity': [],
+        'gt_similarity': []
+    }
+
+    by_modality_stats = defaultdict(lambda: defaultdict(list))
+
+    for ds in dataset_outputs.keys():
+        ds_outputs = torch.stack(dataset_outputs[ds])
+        ds_labels = np.stack(dataset_labels[ds])
+        ds_gt_similarities = np.array(dataset_gt_similarities[ds])
+
+        # Calculate metrics only for classes that appear in the labels
+        valid_classes = np.where((ds_labels.sum(axis=0) > 0) & (ds_labels.sum(axis=0) < len(ds_labels)))[0]
+
+        if len(valid_classes) == 0:
+            logger.warning(f"No valid classes found for dataset {ds}")
+            continue
+
+        ds_outputs = ds_outputs[:, valid_classes].numpy()
+        ds_labels = ds_labels[:, valid_classes]
+
+        # Calculate AUC
+        try:
+            auc = roc_auc_score(ds_labels, ds_outputs, average='weighted')
+        except ValueError:
+            auc = None
+
+        # Calculate sensitivity and specificity using the correct function
+        sensitivity, specificity = calculate_multilabel_metrics(ds_labels, ds_outputs)
+
+        # Calculate mean ground truth similarity
+        mean_gt_similarity = np.mean(ds_gt_similarities)
+
+        # Log dataset-specific metrics
+        stats = {
+            f'{ds}/{split}/zero_shot_auc': auc,
+            f'{ds}/{split}/zero_shot_sensitivity': sensitivity,
+            f'{ds}/{split}/zero_shot_specificity': specificity,
+            f'{ds}/{split}/zero_shot_gt_similarity': mean_gt_similarity,
+            'step': step
+        }
+        wandb.log(stats)
+        logger.info(f"Dataset {ds}: {stats}")
+
+        # Accumulate overall stats
+        if auc is not None:
+            overall_stats['auc'].append(auc)
+        overall_stats['sensitivity'].append(sensitivity)
+        overall_stats['specificity'].append(specificity)
+        overall_stats['gt_similarity'].append(mean_gt_similarity)
+
+        # Accumulate modality stats
+        modality = ds.split('_')[0]
+        by_modality_stats[modality]['auc'].append(auc)
+        by_modality_stats[modality]['sensitivity'].append(sensitivity)
+        by_modality_stats[modality]['specificity'].append(specificity)
+        by_modality_stats[modality]['gt_similarity'].append(mean_gt_similarity)
+
+    # Log overall statistics
+    try:
+        overall_auc = np.mean(overall_stats['auc']) if overall_stats['auc'] else None
+        overall_sensitivity = np.mean(overall_stats['sensitivity'])
+        overall_specificity = np.mean(overall_stats['specificity'])
+        overall_gt_similarity = np.mean(overall_stats['gt_similarity'])
+
+        overall_metrics = {
+            f'{split}/zero_shot_overall_auc': overall_auc,
+            f'{split}/zero_shot_overall_sensitivity': overall_sensitivity,
+            f'{split}/zero_shot_overall_specificity': overall_specificity,
+            f'{split}/zero_shot_overall_gt_similarity': overall_gt_similarity,
+            'step': step,
+            'epoch': epoch
+        }
+
+        # Add modality-specific metrics
+        for modality, stats in by_modality_stats.items():
+            modality_auc = np.mean(stats['auc']) if stats['auc'] else None
+            modality_sensitivity = np.mean(stats['sensitivity'])
+            modality_specificity = np.mean(stats['specificity'])
+            modality_gt_similarity = np.mean(stats['gt_similarity'])
+
+            overall_metrics.update({
+                f'{split}/{modality}_zero_shot_auc': modality_auc,
+                f'{split}/{modality}_zero_shot_sensitivity': modality_sensitivity,
+                f'{split}/{modality}_zero_shot_specificity': modality_specificity,
+                f'{split}/{modality}_zero_shot_gt_similarity': modality_gt_similarity
+            })
+
+        wandb.log(overall_metrics)
+        logger.info(f"Overall zero-shot metrics: {overall_metrics}")
+
+    except ValueError:
+        logger.error('Error calculating overall statistics')
+
+    model.train()
+    return overall_metrics
+
+
 class PretrainingDataset(Dataset):
     def __init__(
             self,
@@ -264,6 +551,8 @@ class PretrainingDataset(Dataset):
                     modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
                     caption = modality + ', ' + target
                     self.captions.append(caption)
+
+        self.unique_captions = list(set(self.captions))
 
         logger.info(f'Loaded {len(self.image_groups)} image/video groups for pretraining')
         self.transform = build_transform(
@@ -412,6 +701,11 @@ def train(
     # Create output directory
     os.makedirs(output_path, exist_ok=True)
 
+    log_file = os.path.join(output_path, 'pretrain.log')
+    file_handler = logging.FileHandler(log_file)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+
     # Load base model
     base_model = InternVLChatModel.from_pretrained(
         model_path,
@@ -446,22 +740,17 @@ def train(
     param_groups = [
         {'params': [p for n, p in model.named_parameters() if p.requires_grad]}
     ]
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=lr,
-        weight_decay=weight_decay
-    )
+    optimizer = SOAP(param_groups, lr=lr, weight_decay=weight_decay)
 
     iters_per_epoch = len(dataloader)
     warmup_iters = warmup_epochs * iters_per_epoch
     total_iters = epochs * iters_per_epoch
 
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        max_lr=lr,
-        total_steps=total_iters,
-        pct_start=warmup_iters / total_iters,
-        anneal_strategy='cos'
+        num_warmup_steps=warmup_iters,
+        num_training_steps=total_iters,
+        num_cycles=1.5
     )
 
     # Training loop

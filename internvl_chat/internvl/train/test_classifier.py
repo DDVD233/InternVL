@@ -121,7 +121,7 @@ def collate_fn(batch):
         'positive_attention_mask': positive_attention_mask,
         'labels': labels,
         'questions': padded_questions,
-        'captions': captions,
+        'caption': captions,
         'targets': targets,
         'dataset': dataset,
         'negative_indices': padded_negative_indices
@@ -558,6 +558,7 @@ class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
             'targets': anchor_ret['targets'],
             'question': anchor_ret['question'],
             'dataset': anchor_ret['dataset'],
+            'caption': anchor_ret['caption'],
         }
 
 
@@ -794,7 +795,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      max_grad_norm=2.0, contrastive_weight=0.5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
-                     eval_only=False, load_checkpoint=None, no_contrastive=False):
+                     eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
@@ -890,6 +891,12 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         logger.info('Freezing vision model')
         for param in model.vision_model.parameters():
             param.requires_grad = False
+
+    if unfreeze_vit_layers != 0:
+        layers = model.vision_model.encoder.layers[unfreeze_vit_layers:]
+        for k, v in layers.named_parameters():
+            logger.info(f'Unfreezing ViT layer: {k}')
+            v.requires_grad = True
 
     # Load the dataset
     dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=collate_fn,
@@ -1024,10 +1031,11 @@ if __name__ == '__main__':
     arg_parser.add_argument('--eval_only', action='store_true')
     arg_parser.add_argument('--load_checkpoint', type=str, default=None)
     arg_parser.add_argument('--no_contrastive', action='store_true')
+    arg_parser.add_argument('--unfreeze_vit_layers', type=int, default=0)
 
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
                      lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
                      meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path,
-                     eval_only=args.eval_only,
-                     load_checkpoint=args.load_checkpoint, no_contrastive=args.no_contrastive)
+                     eval_only=args.eval_only, load_checkpoint=args.load_checkpoint,
+                     no_contrastive=args.no_contrastive, unfreeze_vit_layers=args.unfreeze_vit_layers)
