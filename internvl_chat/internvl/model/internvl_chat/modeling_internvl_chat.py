@@ -19,10 +19,10 @@ from timm.models.layers import DropPath
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
-from transformers import AutoModel, GenerationConfig, LlamaForCausalLM, LlamaTokenizer, Qwen2ForCausalLM
+from transformers import AutoModel, GenerationConfig, LlamaForCausalLM, Qwen2ForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import logging, ModelOutput
+from transformers.utils import logging
 
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
