@@ -19,6 +19,7 @@ import wandb
 from internvl.model.clip import OpenCLIPClassifier
 from internvl.model.convnext import ConvNextV2Classifier
 from internvl.model.eva_classifier import EVA02Classifier
+from internvl.model.swin_transformer import SwinV2Classifier
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 from internvl.model.sbb_vit import ViTSBBClassifier
 from internvl.train.dataset import build_transform, dynamic_preprocess
@@ -28,6 +29,7 @@ from torch import nn
 from torch.utils.data import Dataset, Subset
 from transformers import get_cosine_schedule_with_warmup
 from internvl.train.soap import SOAP
+from internvl.train.sf_soap import SFPaLMForeachSOAP
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -827,6 +829,9 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     elif 'eva' in model_path.lower():
         image_size = 448
         max_dynamic_patch = 2
+    elif 'swintransformer' in model_path.lower():
+        image_size = 192
+        max_dynamic_patch = 12
     else:
         # dynamic_image_size = False
         image_size = 224
@@ -866,6 +871,12 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         model = EVA02Classifier(
             vision_output_size=vocab_size,
             checkpoint_path="eva02_L_pt_m38m_medft_in21k_ft_in1k_p14.pt"
+        ).cuda()
+        model = model.to(torch.bfloat16)
+    elif 'swintransformer' in model_path.lower():
+        model = SwinV2Classifier(
+            vision_output_size=vocab_size,
+            model_name="microsoft/swinv2-large-patch4-window12-192-22k"
         ).cuda()
         model = model.to(torch.bfloat16)
     else:
@@ -925,15 +936,16 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    optimizer = SOAP(model.parameters(), lr=lr, weight_decay=wd)
+    # optimizer = SOAP(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = SFPaLMForeachSOAP(model.parameters(), lr=lr, weight_decay=wd, warmup_steps=warmup_steps)
 
     # Initialize the learning rate scheduler
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-        num_cycles=1.5
-    )
+    # scheduler = get_cosine_schedule_with_warmup(
+    #     optimizer,
+    #     num_warmup_steps=warmup_steps,
+    #     num_training_steps=total_steps,
+    #     num_cycles=1.5
+    # )
 
     if eval_only:
         evaluate_classifier(model, train_val_dataset, device, 'train', bs=bs, step=0, epoch=0, num_samples=8000)
@@ -983,16 +995,16 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
             # Optimizer step
             optimizer.step()
-            scheduler.step()  # Update learning rate
+            # scheduler.step()  # Update learning rate
             optimizer.zero_grad()
 
-            current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
+            # current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
             stats = {
                 'loss': total_loss.item(),
                 'classification_loss': classification_loss.item(),
                 'contrastive_loss': contr_loss.item(),
                 'step': step,
-                'lr': current_lr,  # Log current learning rate
+                'lr': lr,  # Log current learning rate
                 'epoch': epoch
             }
             wandb.log(stats)
