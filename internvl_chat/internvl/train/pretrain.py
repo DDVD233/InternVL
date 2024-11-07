@@ -5,6 +5,7 @@ import math
 import os
 import random
 from collections import defaultdict
+import torch.distributed as dist
 from typing import Dict, Tuple, Any, List, Optional
 
 import numpy as np
@@ -28,11 +29,32 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 from functools import partial
 from internvl.train.soap import SOAP
+from heavyball import SFPaLMForeachSOAP
 
 from internvl.train.pretrain_utils import get_2d_sincos_pos_embed, patchify
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class GatherLayer(torch.autograd.Function):
+    """Gather tensors from all process, supporting backward propagation.
+    """
+
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        output = [torch.zeros_like(input) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, input)
+        return torch.stack(output, 0)
+
+    @staticmethod
+    def backward(ctx, grads):
+        input, = ctx.saved_tensors
+        dist.all_reduce(grads)
+        grad_out = torch.zeros_like(input)
+        grad_out[:] = grads[dist.get_rank()]
+        return grad_out
 
 
 class MAEDecoder(nn.Module):
@@ -139,7 +161,7 @@ class MAEContrastiveWrapper(nn.Module):
         self.label_smoothing = label_smoothing
         self.device = device
 
-        # Learned temperature parameter
+        # Initialize log temperature parameter
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
 
         # Try to get text model from base model, otherwise initialize CLIP
@@ -262,7 +284,7 @@ class MAEContrastiveWrapper(nn.Module):
 
         return x_masked, ids_restore
 
-    def forward(self, pixel_values, input_ids, attention_mask, negative_input_ids=None, negative_attention_mask=None):
+    def forward(self, pixel_values, input_ids, attention_mask):
         """
         Forward pass with support for negative samples
         """
@@ -275,61 +297,55 @@ class MAEContrastiveWrapper(nn.Module):
         image_embeds = self.encode_image(pixel_values)
         text_embeds = self.encode_text(input_ids, attention_mask)
 
-        # Encode negative examples if provided
-        if negative_input_ids is not None:
-            negative_embeds = self.encode_text(negative_input_ids, negative_attention_mask)
-        else:
-            negative_embeds = None
+        return mae_pred, image_embeds, text_embeds
 
-        return mae_pred, image_embeds, text_embeds, negative_embeds
-
-    def get_contrastive_loss(self, image_embeds, positive_text_embeds, negative_text_embeds=None):
+    def get_contrastive_loss(self, image_embeds, text_embeds):
         """
-        Compute contrastive loss with positive and negative pairs.
+        Compute contrastive loss using cross entropy with index-based targets.
         Args:
             image_embeds: [batch_size, embed_dim]
-            positive_text_embeds: [batch_size, embed_dim]
-            negative_text_embeds: Optional [batch_size, embed_dim] for explicit negatives
+            text_embeds: [batch_size, embed_dim]
         """
+        # Get batch size and device
         batch_size = image_embeds.size(0)
+        device = image_embeds.device
 
-        # Scale logits by learned temperature
-        logit_scale = self.logit_scale.exp()
-        text_embeds_all = positive_text_embeds
-        neg_embeds_all = negative_text_embeds
+        # Get current rank for distributed training
+        rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Compute similarity matrices
-        logits_per_image = logit_scale * image_embeds @ text_embeds_all.t()
-        logits_per_text = logits_per_image.t()
-
-        # Create labels with label smoothing
-        labels = torch.arange(batch_size, device=logits_per_image.device)
-        soft_targets = torch.zeros_like(logits_per_image)
-        soft_targets.scatter_(1, labels.view(-1, 1), 1)
-        soft_targets = soft_targets * (1 - self.label_smoothing) + self.label_smoothing / batch_size
-
-        # Compute losses
-        loss_i2t = -torch.sum(soft_targets * F.log_softmax(logits_per_image, dim=1), dim=1).mean()
-        loss_t2i = -torch.sum(soft_targets * F.log_softmax(logits_per_text, dim=1), dim=1).mean()
-
-        # If explicit negatives provided, add hard negative loss
-        if negative_text_embeds is not None:
-            neg_logits = logit_scale * image_embeds @ neg_embeds_all.t()
-            # Push negative pairs apart
-            neg_loss = F.softplus(neg_logits).mean()
-            contrastive_loss = (loss_i2t + loss_t2i) / 2 + 0.1 * neg_loss
+        # Gather embeddings from all devices if using distributed training
+        if dist.is_initialized():
+            image_embeds_all = torch.cat(GatherLayer.apply(image_embeds), dim=0)
+            text_embeds_all = torch.cat(GatherLayer.apply(text_embeds), dim=0)
         else:
-            contrastive_loss = (loss_i2t + loss_t2i) / 2
+            image_embeds_all = image_embeds
+            text_embeds_all = text_embeds
 
-        return contrastive_loss
+        # Compute similarity matrices with temperature scaling
+        logit_scale = self.logit_scale.exp()
+        sim_i2t = logit_scale * (image_embeds @ text_embeds_all.t())
+        sim_t2i = logit_scale * (text_embeds @ image_embeds_all.t())
 
-    def get_loss(self, mae_pred, pixel_values, image_embeds, text_embeds, negative_embeds=None):
+        # Create targets - indices along the diagonal
+        targets = torch.linspace(rank * batch_size,
+                                 rank * batch_size + batch_size - 1,
+                                 batch_size,
+                                 dtype=torch.long,
+                                 device=device)
+
+        # Compute symmetric cross entropy loss with label smoothing
+        loss_i2t = F.cross_entropy(sim_i2t, targets, label_smoothing=self.label_smoothing)
+        loss_t2i = F.cross_entropy(sim_t2i, targets, label_smoothing=self.label_smoothing)
+
+        return (loss_i2t + loss_t2i) / 2
+
+    def get_loss(self, mae_pred, pixel_values, image_embeds, text_embeds):
         # MAE reconstruction loss
         target = patchify(pixel_values)
         mae_loss = F.mse_loss(mae_pred, target)
 
-        # Contrastive loss with support for negatives
-        contrastive_loss = self.get_contrastive_loss(image_embeds, text_embeds, negative_embeds)
+        # Simplified contrastive loss
+        contrastive_loss = self.get_contrastive_loss(image_embeds, text_embeds)
 
         # Combined loss
         total_loss = (1 - self.contrastive_weight) * mae_loss + self.contrastive_weight * contrastive_loss
@@ -442,11 +458,17 @@ def evaluate_zero_shot(
 
         bar = tqdm.tqdm(dataloader, desc=f'Evaluating {split}', total=num_batches)
 
+        batch: dict
         for index, batch in enumerate(bar):
             pixel_values = batch['pixel_values'].to(device)
             datasets = batch['dataset']
-            labels = batch['labels'].to(device)
-            captions = batch.get('caption', None)
+            captions: List[str] = batch.get('caption', [])
+            if len(captions) == 0:
+                logger.warning("No captions found in batch, skipping...")
+                continue
+            labels = torch.zeros(len(pixel_values), len(unique_captions), device=device)
+            for i, cap in enumerate(captions):
+                labels[i, caption_to_idx[cap]] = 1
 
             # Get image embeddings
             image_features = model.encode_image(pixel_values)
@@ -458,16 +480,13 @@ def evaluate_zero_shot(
             probs = F.softmax(similarity / model.temperature, dim=-1)
 
             # Calculate ground truth similarities if captions are available
-            if captions is not None:
-                gt_indices = torch.tensor([caption_to_idx[cap] for cap in captions], device=device)
-                gt_text_features = all_text_features[gt_indices]
-                gt_similarities = F.cosine_similarity(image_features, gt_text_features)
-            else:
-                gt_similarities = torch.zeros(len(pixel_values), device=device)
+            gt_indices = torch.tensor([caption_to_idx[cap] for cap in captions], device=device)
+            gt_text_features = all_text_features[gt_indices]
+            gt_similarities = F.cosine_similarity(image_features, gt_text_features)
 
             # Store outputs, labels, and ground truth similarities by dataset
             for prob, label, gt_sim, ds in zip(probs, labels, gt_similarities, datasets):
-                dataset_outputs[ds].append(prob.cpu())
+                dataset_outputs[ds].append(prob.float().cpu().numpy())
                 dataset_labels[ds].append(label.cpu().numpy())
                 dataset_gt_similarities[ds].append(gt_sim.cpu().item())
 
@@ -485,7 +504,7 @@ def evaluate_zero_shot(
     by_modality_stats = defaultdict(lambda: defaultdict(list))
 
     for ds in dataset_outputs.keys():
-        ds_outputs = torch.stack(dataset_outputs[ds])
+        ds_outputs = np.stack(dataset_outputs[ds])
         ds_labels = np.stack(dataset_labels[ds])
         ds_gt_similarities = np.array(dataset_gt_similarities[ds])
 
@@ -496,7 +515,7 @@ def evaluate_zero_shot(
             logger.warning(f"No valid classes found for dataset {ds}")
             continue
 
-        ds_outputs = ds_outputs[:, valid_classes].numpy()
+        ds_outputs = ds_outputs[:, valid_classes]
         ds_labels = ds_labels[:, valid_classes]
 
         # Calculate AUC
@@ -571,6 +590,7 @@ def evaluate_zero_shot(
 
     except ValueError:
         logger.error('Error calculating overall statistics')
+        return None
 
     model.train()
     return overall_metrics
@@ -596,6 +616,7 @@ class PretrainingDataset(Dataset):
         # Load metadata
         self.image_groups = []  # List of lists of image paths or video paths
         self.captions = []
+        self.datasets = []  # Track which dataset each entry belongs to
         self.is_video = []  # Track which entries are videos
 
         with open(meta_path, 'r') as f:
@@ -623,7 +644,10 @@ class PretrainingDataset(Dataset):
                                                                                                                 'dermoscopy')
                     modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
                     caption = modality + ', ' + target
+                    caption = caption.replace('_', ' ')
                     self.captions.append(caption)
+
+                    self.datasets.append(ds_name)
 
         self.unique_captions = list(set(self.captions))
 
@@ -741,7 +765,8 @@ class PretrainingDataset(Dataset):
             'pixel_values': grid,
             'caption': caption,
             'num_images': len(images),
-            'is_video': is_video
+            'is_video': is_video,
+            'dataset': self.datasets[idx]
         }
 
 
@@ -821,54 +846,13 @@ def train(
         {'params': [p for n, p in model.named_parameters() if p.requires_grad]}
     ]
 
-    def collate_with_negatives(batch, tokenizer):
-        pixel_values = torch.stack([item['pixel_values'] for item in batch])
-
-        # Get positive captions
-        pos_texts = [item['caption'] for item in batch]
-
-        # Sample negative captions for each item
-        neg_texts = []
-        for _ in range(len(batch)):
-            # Sample a different caption from the dataset's unique captions
-            while True:
-                neg = random.choice(dataset.unique_captions)
-                if neg not in pos_texts:  # Ensure it's not the positive caption
-                    neg_texts.append(neg)
-                    break
-
-        # Tokenize positive and negative captions
-        pos_tokens = tokenizer(
-            pos_texts,
-            padding=True,
-            truncation=True,
-            max_length=77,
-            return_tensors="pt"
-        )
-
-        neg_tokens = tokenizer(
-            neg_texts,
-            padding=True,
-            truncation=True,
-            max_length=77,
-            return_tensors="pt"
-        )
-
-        return {
-            'pixel_values': pixel_values,
-            'input_ids': pos_tokens.input_ids,
-            'attention_mask': pos_tokens.attention_mask,
-            'negative_input_ids': neg_tokens.input_ids,
-            'negative_attention_mask': neg_tokens.attention_mask
-        }
-
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=32,
         pin_memory=True,
-        collate_fn=lambda batch: collate_with_negatives(batch, model.tokenizer)
+        collate_fn=lambda batch: collate_fn(batch, model.tokenizer)
     )
 
     val_loader = DataLoader(
@@ -877,10 +861,12 @@ def train(
         shuffle=False,
         num_workers=32,
         pin_memory=True,
-        collate_fn=lambda batch: collate_with_negatives(batch, model.tokenizer)
+        collate_fn=lambda batch: collate_fn(batch, model.tokenizer)
     )
 
     optimizer = SOAP(param_groups, lr=lr, weight_decay=weight_decay)
+    # optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+    # optimizer = SFPaLMForeachSOAP(param_groups, lr=lr, weight_decay=weight_decay)
     warmup_iters = 500
     iters_per_epoch = len(train_loader)
     total_iters = epochs * iters_per_epoch
@@ -901,16 +887,12 @@ def train(
             pixel_values = batch['pixel_values'].cuda().to(torch.bfloat16)
             input_ids = batch['input_ids'].cuda()
             attention_mask = batch['attention_mask'].cuda()
-            neg_input_ids = batch['negative_input_ids'].cuda()
-            neg_attention_mask = batch['negative_attention_mask'].cuda()
 
             # Forward pass with negative samples
-            mae_pred, image_embeds, text_embeds, negative_embeds = model(
+            mae_pred, image_embeds, text_embeds = model(
                 pixel_values,
                 input_ids,
-                attention_mask,
-                neg_input_ids,
-                neg_attention_mask
+                attention_mask
             )
 
             # Compute loss
@@ -919,7 +901,6 @@ def train(
                 pixel_values,
                 image_embeds,
                 text_embeds,
-                negative_embeds
             )
 
             # Rest of training loop (backward pass, optimizer step, etc.)
@@ -930,17 +911,10 @@ def train(
 
             # Log additional metrics
             with torch.no_grad():
-                # Calculate image-text similarity for positives
-                pos_sim = F.cosine_similarity(image_embeds, text_embeds).mean()
-                # Calculate image-text similarity for negatives
-                neg_sim = F.cosine_similarity(image_embeds, negative_embeds).mean()
-
                 stats = {
                     'total_loss': total_loss.item(),
                     'mae_loss': mae_loss.item(),
                     'contrastive_loss': contrastive_loss.item(),
-                    'positive_similarity': pos_sim.item(),
-                    'negative_similarity': neg_sim.item(),
                     'logit_scale': model.logit_scale.exp().item(),
                     'lr': optimizer.param_groups[0]['lr'],
                     'step': step,
@@ -949,6 +923,18 @@ def train(
                 wandb.log(stats)
 
             # Evaluation and checkpointing
+            if step % 500 == 0:
+                # Run zero-shot evaluation
+                evaluate_zero_shot(
+                    model,
+                    val_dataset,
+                    model.device,
+                    'val',
+                    batch_size,
+                    step,
+                    epoch,
+                    dataloader=val_loader
+                )
             if step % 1000 == 0 and step > 0:
                 # Save checkpoint
                 torch.save(
@@ -961,17 +947,7 @@ def train(
                     },
                     os.path.join(output_path, f'checkpoint_{step}.pt')
                 )
-                # Run zero-shot evaluation
-                evaluate_zero_shot(
-                    model,
-                    val_dataset,
-                    model.device,
-                    'val',
-                    batch_size,
-                    step,
-                    epoch,
-                    dataloader=val_loader
-                )
+                logger.info(f'Saved checkpoint at step {step}')
 
             step += 1
 
@@ -993,7 +969,9 @@ def collate_fn(batch, tokenizer):
     return {
         'pixel_values': pixel_values,
         'input_ids': tokenized.input_ids,
-        'text_attention_mask': tokenized.attention_mask
+        'attention_mask': tokenized.attention_mask,
+        'dataset': [item['dataset'] for item in batch],
+        'caption': texts
     }
 
 
@@ -1046,9 +1024,9 @@ if __name__ == '__main__':
                         help='Number of epochs to train')
 
     # Data parameters
-    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_pretrain.json',
+    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_pretrain_local.json',
                         help='Path to training metadata')
-    parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_pretrain_valid.json',
+    parser.add_argument('--meta_valid_path', type=str, default='../../../processing/meta_pretrain_valid_local.json',
                         help='Path to training metadata')
 
     # Output parameters
