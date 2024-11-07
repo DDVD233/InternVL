@@ -25,11 +25,11 @@ from .constants import (
     SIGLIP_STD
 )
 
-try:
-    from petrel_client.client import Client
-    from petrel_client.common.config import Config
-except ImportError as E:
-    print('petrel_client is not installed. If you read data locally instead of from ceph, ignore it.')
+# try:
+#     from petrel_client.client import Client
+#     from petrel_client.common.config import Config
+# except ImportError as E:
+#     print('petrel_client is not installed. If you read data locally instead of from ceph, ignore it.')
 import sys
 
 
