@@ -143,21 +143,25 @@ def _get_orthogonal_matrix(mat):
 def _compute_ggt(grad, GG, max_precond_dim, merge_dims, precondition_1d, beta):
     if grad.dim() == 1:
         if precondition_1d and grad.shape[0] <= max_precond_dim:
-            GG[0].lerp_(grad.unsqueeze(1) * grad.unsqueeze(0), 1 - beta)
+            grad_float = grad.float()
+            outer_product = grad_float.unsqueeze(1) * grad_float.unsqueeze(0)
+            GG[0].lerp_(outer_product, 1 - beta)
         return
 
     if merge_dims:
         new_grad = _merge_dims(grad, max_precond_dim)
         for idx, sh in enumerate(new_grad.shape):
             if sh <= max_precond_dim:
-                outer_product = torch.tensordot(new_grad, new_grad,
+                new_grad_float = new_grad.float()
+                outer_product = torch.tensordot(new_grad_float, new_grad_float,
                                                 dims=[[*chain(range(idx), range(idx + 1, len(new_grad.shape)))]] * 2)
                 GG[idx].lerp_(outer_product, 1 - beta)
         return
 
     for idx, sh in enumerate(grad.shape):
         if sh <= max_precond_dim:
-            outer_product = torch.tensordot(grad, grad,  # Contracts across all dimensions except for k.
+            grad_float = grad.float()
+            outer_product = torch.tensordot(grad_float, grad_float,
                                             dims=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2)
             GG[idx].lerp_(outer_product, 1 - beta)
 
@@ -182,7 +186,7 @@ def _init_preconditioner(grad, state, max_precond_dim=10000, precondition_1d=Fal
         if not precondition_1d or grad.shape[0] > max_precond_dim:
             state['GG'].append([])
         else:
-            state['GG'].append(torch.zeros(grad.shape[0], grad.shape[0], device=grad.device))
+            state['GG'].append(torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=torch.float32))
     else:
         if merge_dims:
             grad = _merge_dims(grad, max_precond_dim)
@@ -191,7 +195,7 @@ def _init_preconditioner(grad, state, max_precond_dim=10000, precondition_1d=Fal
             if sh > max_precond_dim:
                 state['GG'].append([])
             else:
-                state['GG'].append(torch.zeros(sh, sh, device=grad.device))
+                state['GG'].append(torch.zeros(sh, sh, device=grad.device, dtype=torch.float32))
 
     state['Q'] = None  # Will hold all the eigenbases of the preconditioner.
 
@@ -224,7 +228,7 @@ def _project(grad, Q, merge_dims, max_precond_dim, back: bool):
 
 class SFPaLMForeachSOAP(optim.Optimizer):
     def __init__(self, params, lr: float = 3e-3, beta=0.9, beta2_scale: float = 0.8, eps: float = 1e-8,
-                 weight_decay: float = 0.01, precondition_frequency: int = 2, max_precond_dim: int = 2048,  #
+                 weight_decay: float = 0.01, precondition_frequency: int = 2, max_precond_dim: int = 2048,
                  merge_dims: bool = True, precondition_1d: bool = False, normalize_grads: bool = False,
                  data_format: str = "channels_first", correct_bias: bool = True, warmup_steps: int = 1, r=0.0,
                  weight_lr_power=2.0, gradient_clip_val: float = 0.1):
@@ -238,38 +242,8 @@ class SFPaLMForeachSOAP(optim.Optimizer):
         self._data_format = data_format
         self.rng = random.Random(0x120983109)
 
-    def eval(self):
-        for group in self.param_groups:
-            train_mode = group['train_mode']
-            beta1 = group['beta']
-            if beta1 > 0 and train_mode:
-                for p in group['params']:
-                    state = self.state[p]
-                    if 'z' in state:
-                        # Set p.data to x
-                        p.data.lerp_(end=state['z'], weight=1 - 1 / beta1)
-                group['train_mode'] = False
-
-    def train(self):
-        for group in self.param_groups:
-            train_mode = group['train_mode']
-            beta1 = group['beta']
-            if beta1 > 0 and not train_mode:
-                for p in group['params']:
-                    state = self.state[p]
-                    if 'z' in state:
-                        # Set p.data to y
-                        p.data.lerp_(end=state['z'], weight=1 - beta1)
-                group['train_mode'] = True
-
     @torch.no_grad()
     def step(self, closure=None):
-        """
-        Performs a single optimization step.
-
-        Arguments:
-            closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
-        """
         if closure is None:
             loss = None
         else:
@@ -283,7 +257,6 @@ class SFPaLMForeachSOAP(optim.Optimizer):
 
             step = group['step'] = group.get("step", -1) + 1
 
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -291,9 +264,12 @@ class SFPaLMForeachSOAP(optim.Optimizer):
                 p.grad = None
                 vals.append((p, grad))
 
+            if not vals:
+                continue
+
             p_list, grad = zip(*vals)
 
-            # adaptive gradient clipping
+            # Handle gradient clipping
             if group["gradient_clip_val"] > 0:
                 p_norm = torch._foreach_norm(p_list)
                 g_norm = torch._foreach_norm(grad)
@@ -305,20 +281,19 @@ class SFPaLMForeachSOAP(optim.Optimizer):
                 torch._foreach_mul_(grad, p_norm)
 
             vals = []
-
             for p, grad in zip(p_list, grad):
                 state = self.state[p]
 
-                if "z" not in state:
-                    state["z"] = torch.clone(p.data)
-                    state["exp_avg_sq"] = torch.zeros_like(grad)
+                # Initialize state if needed
+                if len(state) == 0:
+                    state["exp_avg_sq"] = torch.zeros_like(grad, dtype=torch.float32)
+                    state["z"] = torch.clone(p.data).to(dtype=torch.float32)
                     _init_preconditioner(grad, state, max_precond_dim, precondition_1d, merge_dims)
                     _update_preconditioner(grad, state, max_precond_dim, merge_dims, precondition_1d, 0, True)
-                    continue  # first step is skipped so that we never use the current gradients in the projection.
+                    continue
 
-                # Projecting gradients to the eigenbases of Shampoo's preconditioner
-                # i.e. projecting to the eigenbases of matrices in state['GG']
-                grad_projected = _project(grad, state['Q'], merge_dims, max_precond_dim, False)
+                # Project gradients and get state variables
+                grad_projected = _project(grad.float(), state['Q'], merge_dims, max_precond_dim, False)
                 z, exp_avg_sq = state["z"], state["exp_avg_sq"]
                 vals.append((p, grad, grad_projected, z, exp_avg_sq))
 
@@ -327,35 +302,34 @@ class SFPaLMForeachSOAP(optim.Optimizer):
 
             p_list, grad, grad_projected, z, exp_avg_sq = zip(*vals)
             beta1 = group["beta"]
-
             beta2 = 1 - max(step, 1) ** -group['beta2_scale']
             bias_correction2 = 1.0 - beta2 ** step
             new_debiased2 = (1 - beta2) / bias_correction2
 
-            # Decay the first and second moment running average coefficient
-            # In-place operations to update the averages at the same time
+            # Update moment estimates
             torch._foreach_mul_(exp_avg_sq, 1 - new_debiased2)
             torch._foreach_addcmul_(exp_avg_sq, grad_projected, grad_projected, value=new_debiased2)
+
+            # Compute denominator
             denom = torch._foreach_sqrt(exp_avg_sq)
             torch._foreach_maximum_(denom, group["eps"])
             torch._foreach_div_(grad_projected, denom)
 
-            update_precond = group['step'] > 0 and group['step'] % group['precondition_frequency'] == 0
+            # Update preconditioner if needed
+            update_precond = step > 0 and step % group['precondition_frequency'] == 0
 
             for p, g, gp in zip(p_list, grad, grad_projected):
                 state = self.state[p]
-                # Projecting back the preconditioned (by Adam) exponential moving average of gradients
-                # to the original space
-                # CANT DO /= HERE AS EXP_AVG MAY POINT TO THE BUFFER
-                set_(gp, _project(gp, state['Q'], merge_dims, max_precond_dim, back=True))
-
+                gp_orig = _project(gp, state['Q'], merge_dims, max_precond_dim, back=True)
+                gp.copy_(gp_orig)
                 _update_preconditioner(g, state, max_precond_dim, merge_dims, precondition_1d, 1 - new_debiased2,
                                        update_precond)
 
-            # Weight decay calculated at y
+            # Apply weight decay
             if group["weight_decay"] > 0:
-                torch._foreach_add_(grad, p_list, alpha=group["weight_decay"])
+                torch._foreach_add_(grad_projected, p_list, alpha=group["weight_decay"])
 
+            # Compute learning rate and update weights
             lr = group["lr"] * min(step / group['warmup_steps'], 1)
             weight = lr ** group['weight_lr_power']
             weight_sum = group['weight_sum'] = group.get('weight_sum', 0) + weight
@@ -365,11 +339,51 @@ class SFPaLMForeachSOAP(optim.Optimizer):
             except ZeroDivisionError:
                 ckp1 = 0
 
-            # These operations update y in-place,
-            # without computing x explicitly.
-            torch._foreach_lerp_(p_list, z, weight=ckp1)
-            torch._foreach_add_(p_list, grad_projected, alpha=lr * (beta1 * (1 - ckp1) - 1))
+            # Update parameters
+            for p, gp, z_tensor in zip(p_list, grad_projected, z):
+                # Convert everything to float32 for the update
+                p_float = p.data.float()
+                gp_float = gp.float()
+                z_float = z_tensor.float()
 
-            # z step
-            torch._foreach_sub_(z, grad_projected, alpha=lr)
-        return loss
+                p_float.lerp_(z_float, weight=ckp1)
+                p_float.add_(gp_float, alpha=lr * (beta1 * (1 - ckp1) - 1))
+
+                # Convert back to original dtype
+                p.data.copy_(p_float.to(p.dtype))
+
+                # Update z state
+                z_float.sub_(gp_float, alpha=lr)
+                z_tensor.copy_(z_float)
+
+            return loss
+
+    def eval(self):
+        for group in self.param_groups:
+            train_mode = group['train_mode']
+            beta1 = group['beta']
+            if beta1 > 0 and train_mode:
+                for p in group['params']:
+                    state = self.state[p]
+                    if 'z' in state:
+                        # Convert to float32, perform operation, then back to original dtype
+                        p_float = p.data.float()
+                        z_float = state['z'].float()
+                        p_float.lerp_(end=z_float, weight=1 - 1 / beta1)
+                        p.data.copy_(p_float.to(p.dtype))
+                group['train_mode'] = False
+
+    def train(self):
+        for group in self.param_groups:
+            train_mode = group['train_mode']
+            beta1 = group['beta']
+            if beta1 > 0 and not train_mode:
+                for p in group['params']:
+                    state = self.state[p]
+                    if 'z' in state:
+                        # Convert to float32, perform operation, then back to original dtype
+                        p_float = p.data.float()
+                        z_float = state['z'].float()
+                        p_float.lerp_(end=z_float, weight=1 - beta1)
+                        p.data.copy_(p_float.to(p.dtype))
+                group['train_mode'] = True

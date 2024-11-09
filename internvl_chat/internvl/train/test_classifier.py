@@ -831,7 +831,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         max_dynamic_patch = 2
     elif 'swintransformer' in model_path.lower():
         image_size = 192
-        max_dynamic_patch = 12
+        max_dynamic_patch = 8
     else:
         # dynamic_image_size = False
         image_size = 224
@@ -892,8 +892,12 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                     new_key: str = key.replace('encoder.', 'vision_model.', 1)
                     new_checkpoint[new_key] = value
             checkpoint = new_checkpoint
-        model.load_state_dict(checkpoint, strict=False)
-        print(f'Loaded checkpoint from {load_checkpoint}')
+        incompatible_keys = model.load_state_dict(checkpoint, strict=False)
+        logger.info(f'Loaded checkpoint from {load_checkpoint}')
+        if incompatible_keys.missing_keys:
+            logger.warning(f'Missing keys: {incompatible_keys.missing_keys}')
+        if incompatible_keys.unexpected_keys:
+            logger.warning(f'Unexpected keys: {incompatible_keys.unexpected_keys}')
     model.train()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -936,16 +940,17 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    # optimizer = SOAP(model.parameters(), lr=lr, weight_decay=wd)
-    optimizer = SFPaLMForeachSOAP(model.parameters(), lr=lr, weight_decay=wd, warmup_steps=warmup_steps)
+    optimizer = SOAP(model.parameters(), lr=lr, weight_decay=wd)
+    # optimizer = SFPaLMForeachSOAP(model.parameters(), lr=lr * 10, weight_decay=wd, warmup_steps=warmup_steps)
+    # optimizer.train()
 
     # Initialize the learning rate scheduler
-    # scheduler = get_cosine_schedule_with_warmup(
-    #     optimizer,
-    #     num_warmup_steps=warmup_steps,
-    #     num_training_steps=total_steps,
-    #     num_cycles=1.5
-    # )
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+        num_cycles=1.5
+    )
 
     if eval_only:
         evaluate_classifier(model, train_val_dataset, device, 'train', bs=bs, step=0, epoch=0, num_samples=8000)
@@ -998,13 +1003,13 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             # scheduler.step()  # Update learning rate
             optimizer.zero_grad()
 
-            # current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
+            current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
             stats = {
                 'loss': total_loss.item(),
                 'classification_loss': classification_loss.item(),
                 'contrastive_loss': contr_loss.item(),
                 'step': step,
-                'lr': lr,  # Log current learning rate
+                'lr': current_lr,  # Log current learning rate
                 'epoch': epoch
             }
             wandb.log(stats)
