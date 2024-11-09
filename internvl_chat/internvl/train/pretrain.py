@@ -29,7 +29,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 from functools import partial
 from internvl.train.soap import SOAP
-from heavyball import SFPaLMForeachSOAP
+from internvl.train.sf_soap import SFPaLMForeachSOAP
 
 from internvl.train.pretrain_utils import get_2d_sincos_pos_embed, patchify
 
@@ -850,7 +850,7 @@ def train(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=32,
+        num_workers=64,
         pin_memory=True,
         collate_fn=lambda batch: collate_fn(batch, model.tokenizer)
     )
@@ -859,14 +859,13 @@ def train(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=32,
+        num_workers=64,
         pin_memory=True,
         collate_fn=lambda batch: collate_fn(batch, model.tokenizer)
     )
 
     optimizer = SOAP(param_groups, lr=lr, weight_decay=weight_decay)
     # optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
-    # optimizer = SFPaLMForeachSOAP(param_groups, lr=lr, weight_decay=weight_decay)
     warmup_iters = 500
     iters_per_epoch = len(train_loader)
     total_iters = epochs * iters_per_epoch
@@ -910,20 +909,21 @@ def train(
             lr_scheduler.step()
 
             # Log additional metrics
+            current_lr = lr_scheduler.get_last_lr()[0]
             with torch.no_grad():
                 stats = {
                     'total_loss': total_loss.item(),
                     'mae_loss': mae_loss.item(),
                     'contrastive_loss': contrastive_loss.item(),
                     'logit_scale': model.logit_scale.exp().item(),
-                    'lr': optimizer.param_groups[0]['lr'],
+                    'lr': current_lr,
                     'step': step,
                     'epoch': epoch
                 }
                 wandb.log(stats)
 
             # Evaluation and checkpointing
-            if step % 500 == 0:
+            if step % 500 == 0 and step > 0:
                 # Run zero-shot evaluation
                 evaluate_zero_shot(
                     model,
@@ -941,7 +941,7 @@ def train(
                     {
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
+                        # 'lr_scheduler': lr_scheduler.state_dict(),
                         'epoch': epoch,
                         'step': step,
                     },
