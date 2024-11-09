@@ -29,7 +29,8 @@ from torch import nn
 from torch.utils.data import Dataset, Subset
 from transformers import get_cosine_schedule_with_warmup
 from internvl.train.soap import SOAP
-from internvl.train.sf_soap import SFPaLMForeachSOAP
+# from internvl.train.sf_soap import SFPaLMForeachSOAP
+from heavyball import PrecondScheduleForeachSOAP
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -335,7 +336,8 @@ class LazySupervisedDataset(Dataset):
                     data['targets'] = targets
                     data['dataset'] = ds_name
                     modality = ds_name.split('_')[0]  # chest, derm, mammo, etc
-                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm', 'dermoscopy')
+                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm',
+                                                                                                                'dermoscopy')
                     modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
                     data['modality'] = modality
                     data['caption'] = modality + ', ' + target
@@ -564,6 +566,108 @@ class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
         }
 
 
+class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
+    """Dataset for few-shot supervised fine-tuning with contrastive learning."""
+
+    def __init__(
+            self,
+            meta_path,
+            num_image_token,
+            output_path,
+            few_shot_datasets=None,
+            shots_per_class=32,
+            image_size=448,
+            is_train=False,
+            pad2square=False,
+            group_by_length=False,
+            dynamic_image_size=True,
+            use_thumbnail=False,
+            min_dynamic_patch=1,
+            max_dynamic_patch=8,
+            min_num_frame=4,
+            normalize_type='imagenet',
+            random_seed=0,
+            rebuild_vocab=False,
+    ):
+        # Initialize with parent class first
+        super().__init__(
+            meta_path=meta_path,
+            num_image_token=num_image_token,
+            output_path=output_path,
+            image_size=image_size,
+            is_train=is_train,
+            pad2square=pad2square,
+            group_by_length=group_by_length,
+            dynamic_image_size=dynamic_image_size,
+            use_thumbnail=use_thumbnail,
+            min_dynamic_patch=min_dynamic_patch,
+            max_dynamic_patch=max_dynamic_patch,
+            min_num_frame=min_num_frame,
+            normalize_type=normalize_type,
+            random_seed=random_seed,
+            rebuild_vocab=rebuild_vocab,
+        )
+
+        self.few_shot_datasets = few_shot_datasets or []
+        self.shots_per_class = shots_per_class
+
+        if self.few_shot_datasets and self.is_train:
+            logger.info(f'Applying few-shot sampling for datasets: {few_shot_datasets}')
+            logger.info(f'Shots per class: {shots_per_class}')
+
+            # Organize data by dataset and label combination
+            dataset_label_data = defaultdict(lambda: defaultdict(list))
+            for item in self.data_items:
+                dataset_label_data[item['dataset']][tuple(item['labels'])].append(item)
+
+            # Apply few-shot sampling
+            final_data_items = []
+            for dataset, label_data in tqdm.tqdm(dataset_label_data.items(), desc='Few-shot sampling'):
+                if dataset in self.few_shot_datasets:
+                    # Few-shot sampling
+                    dataset_size = 0
+                    sampled_items = []
+                    for label_tuple, items in label_data.items():
+                        samples = random.sample(items, min(self.shots_per_class, len(items)))
+                        sampled_items.extend(samples)
+                        dataset_size += len(items)
+
+                    # Oversample to match original dataset size
+                    if sampled_items:
+                        num_repeats = max(1, dataset_size // len(sampled_items))
+                        final_data_items.extend(sampled_items * num_repeats)
+                else:
+                    # Keep all samples for non-few-shot datasets
+                    for items in label_data.values():
+                        final_data_items.extend(items)
+
+            # Update dataset
+            self.data_items = final_data_items
+            # shuffle data
+            self.rng.shuffle(self.data_items)
+
+            # Rebuild contrastive learning indices
+            self.dataset_label_to_indices = defaultdict(dict)
+            for idx, item in enumerate(self.data_items):
+                label_tuple = tuple(item['labels'])
+                dataset = item['dataset']
+                if label_tuple not in self.dataset_label_to_indices[dataset]:
+                    self.dataset_label_to_indices[dataset][label_tuple] = []
+                self.dataset_label_to_indices[dataset][label_tuple].append(idx)
+
+            # Rebuild label set and different labels mapping
+            self.label_set = set(tuple(item['labels']) for item in self.data_items)
+            self.different_labels = {
+                label: list(self.label_set - {label}) for label in self.label_set
+            }
+
+            # Log dataset statistics
+            logger.info(f'Dataset size after few-shot processing: {len(self.data_items)}')
+            for dataset in self.few_shot_datasets:
+                count = sum(1 for item in self.data_items if item['dataset'] == dataset)
+                logger.info(f'Samples in few-shot dataset {dataset}: {count}')
+
+
 def contrastive_loss(anchor, positive, negative_indices, temperature=0.07):
     batch_size = anchor.size(0)
 
@@ -714,12 +818,12 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             perfect_match = accuracy = (predictions == ds_labels).mean()
 
         try:
-            auc = roc_auc_score(ds_labels, ds_outputs, average='weighted')
+            auc = roc_auc_score(ds_labels, ds_outputs, average='macro')
         except ValueError:
             auc = None
 
         sensitivity, specificity = calculate_multilabel_metrics(ds_labels, predictions)
-        f1_scores = f1_score(ds_labels, predictions, average='weighted')
+        f1_scores = f1_score(ds_labels, predictions, average='macro')
 
         # Log dataset-specific metrics to wandb
         stats = {
@@ -797,24 +901,22 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      max_grad_norm=2.0, contrastive_weight=0.5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
-                     eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0):
+                     eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0,
+                     few_shot=False, shots_per_class=32):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    wandb.init(project='high_modality')
 
     # Create and setup file handler
     log_file = os.path.join(output_path, 'train.log')
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
-
-    # Add both handlers to the logger
     logger.addHandler(file_handler)
 
     # Log all args passed into this function
     logger.info(f'Arguments: {locals()}')
-
-    wandb.init(project='high_modality')
 
     rebuild_vocab = True
     if load_checkpoint is not None:
@@ -837,10 +939,26 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         image_size = 224
         max_dynamic_patch = 2
     logger.info(f'Image size: {image_size}, Max dynamic patch: {max_dynamic_patch}')
-    train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
-                                                     num_image_token=256, rebuild_vocab=rebuild_vocab,
-                                                     is_train=True, dynamic_image_size=False,
-                                                     image_size=image_size, max_dynamic_patch=max_dynamic_patch)
+
+    few_shot_datasets = []
+    if few_shot:
+        with open(meta_valid_path, 'r') as f:
+            valid_meta = json.load(f)
+            few_shot_datasets = list(valid_meta.keys())
+        logger.info(f'Few-shot datasets from validation: {few_shot_datasets}')
+
+        train_dataset = FewShotContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
+                                                                num_image_token=256, rebuild_vocab=rebuild_vocab,
+                                                                is_train=True, dynamic_image_size=False,
+                                                                image_size=image_size,
+                                                                max_dynamic_patch=max_dynamic_patch,
+                                                                few_shot_datasets=few_shot_datasets,
+                                                                shots_per_class=shots_per_class)
+    else:
+        train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
+                                                         num_image_token=256, rebuild_vocab=rebuild_vocab,
+                                                         is_train=True, dynamic_image_size=False,
+                                                         image_size=image_size, max_dynamic_patch=max_dynamic_patch)
 
     train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256,
                                               output_path=output_path, dynamic_image_size=False,
@@ -915,7 +1033,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Load the dataset
     dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=collate_fn,
-                                             num_workers=32, pin_memory=True)
+                                             num_workers=64, pin_memory=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
                                                  num_workers=32, pin_memory=True)
     train_val_loader = torch.utils.data.DataLoader(train_val_dataset, batch_size=bs, shuffle=True,
@@ -940,7 +1058,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    optimizer = SOAP(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = PrecondScheduleForeachSOAP(model.parameters(), lr=lr, weight_decay=wd)
     # optimizer = SFPaLMForeachSOAP(model.parameters(), lr=lr * 10, weight_decay=wd, warmup_steps=warmup_steps)
     # optimizer.train()
 
@@ -1000,7 +1118,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
             # Optimizer step
             optimizer.step()
-            # scheduler.step()  # Update learning rate
+            scheduler.step()  # Update learning rate
             optimizer.zero_grad()
 
             current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
@@ -1020,12 +1138,6 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                                     num_samples=8000, dataloader=train_val_loader)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
                                     num_samples=-1, dataloader=val_dataloader)
-            # if step == 100:
-            #     evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
-            #                         num_samples=8000, dataloader=train_val_loader)
-            #     evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
-            #                         num_samples=-1, dataloader=val_dataloader)
-            # save every 1000 steps
             if step % 1000 == 0:
                 torch.save(model.state_dict(), os.path.join(output_path, f'model_{step}.pt'))
             step += 1
@@ -1038,7 +1150,7 @@ if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL2-8B')
     arg_parser.add_argument('--output_path', type=str, required=True)
-    arg_parser.add_argument('--lr', type=float, default=1.5e-5)
+    arg_parser.add_argument('--lr', type=float, default=1.5e-4)
     arg_parser.add_argument('--wd', type=float, default=0.005)
     arg_parser.add_argument('--bs', type=int, default=32)
     arg_parser.add_argument('--epochs', type=int, default=3)
@@ -1049,10 +1161,15 @@ if __name__ == '__main__':
     arg_parser.add_argument('--load_checkpoint', type=str, default=None)
     arg_parser.add_argument('--no_contrastive', action='store_true')
     arg_parser.add_argument('--unfreeze_vit_layers', type=int, default=0)
+    arg_parser.add_argument('--few_shot', action='store_true',
+                            help='Enable few-shot learning mode')
+    arg_parser.add_argument('--shots_per_class', type=int, default=8,
+                            help='Number of samples per class in few-shot mode')
 
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
                      lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
                      meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path,
                      eval_only=args.eval_only, load_checkpoint=args.load_checkpoint,
-                     no_contrastive=args.no_contrastive, unfreeze_vit_layers=args.unfreeze_vit_layers)
+                     no_contrastive=args.no_contrastive, unfreeze_vit_layers=args.unfreeze_vit_layers,
+                     few_shot=args.few_shot, shots_per_class=args.shots_per_class)
