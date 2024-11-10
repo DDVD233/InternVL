@@ -341,7 +341,11 @@ class LazySupervisedDataset(Dataset):
                     modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
                     data['modality'] = modality
                     data['caption'] = modality + ', ' + target
-                    data_items.append(data)
+                    if 'images' in data:
+                        data_items.append(data)
+                    elif 'videos' in data:
+                        # Oversampling 20x for video data
+                        data_items.extend([data] * 20)
                     bar.update(1)
 
         # meta_name = os.path.basename(meta_path).replace('.json', '').replace('_train', '').replace('_valid', '')
@@ -1151,7 +1155,7 @@ if __name__ == '__main__':
     arg_parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL2-8B')
     arg_parser.add_argument('--output_path', type=str, required=True)
     arg_parser.add_argument('--lr', type=float, default=1.5e-4)
-    arg_parser.add_argument('--wd', type=float, default=0.005)
+    arg_parser.add_argument('--wd', type=float, default=0.01)
     arg_parser.add_argument('--bs', type=int, default=32)
     arg_parser.add_argument('--epochs', type=int, default=3)
     arg_parser.add_argument('--freeze_vision', action='store_true')
