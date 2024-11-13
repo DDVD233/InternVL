@@ -190,28 +190,32 @@ class InternVLChatModel(PreTrainedModel):
         )
 
         self.vision_only = vision_only
+        self.clip_projector = AttentionPoolingBlock(
+            dim=vit_hidden_size,
+            num_heads=8,  # Can be configured in config
+            qkv_bias=True,
+            qk_scale=None,
+            drop=0.,
+            attn_drop=0.,
+            norm_layer=partial(nn.LayerNorm, eps=1e-5),
+            out_dim=512
+        )
+        text_hidden_size = config.llm_config.hidden_size
+        self.contrastive_query_embeds = nn.Parameter(
+            torch.zeros(1, 96, text_hidden_size)  # [1, num_queries, hidden_size]
+        )
+        torch.nn.init.normal_(self.contrastive_query_embeds, std=0.02)
+
+        self.fc = nn.Linear(512, vision_output_size)
+
+        # init_weights
+        for m in self.fc.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.data.normal_(mean=0.0, std=0.02)
+                m.bias.data.zero_()
         if vision_only:
             self.language_model = None
             self.mlp1 = None
-
-            self.clip_projector = AttentionPoolingBlock(
-                dim=vit_hidden_size,
-                num_heads=8,  # Can be configured in config
-                qkv_bias=True,
-                qk_scale=None,
-                drop=0.,
-                attn_drop=0.,
-                norm_layer=partial(nn.LayerNorm, eps=1e-5),
-                out_dim=512
-            )
-
-            self.fc = nn.Linear(512, vision_output_size)
-
-            # init_weights
-            for m in self.fc.modules():
-                if isinstance(m, nn.Linear):
-                    m.weight.data.normal_(mean=0.0, std=0.02)
-                    m.bias.data.zero_()
 
         self.img_context_token_id = None
         self.conv_template = get_conv_template(self.template)
@@ -274,6 +278,7 @@ class InternVLChatModel(PreTrainedModel):
     def _init_attention_pool(self):
         """Initialize the attention pooling parameters."""
         # Initialize query tokens
+        torch.nn.init.normal_(self.contrastive_query_embeds, std=0.02)
         for name, param in self.clip_projector.named_parameters():
             if 'q' in name:
                 nn.init.trunc_normal_(param, std=0.02)
@@ -326,6 +331,154 @@ class InternVLChatModel(PreTrainedModel):
             return self.classify(features)
         else:
             return features
+
+    def forward_contrastive(
+            self,
+            pixel_values: torch.FloatTensor,
+            input_ids: torch.LongTensor,
+            attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        """
+        Forward pass that combines:
+        1. Contrastive learning between image and text embeddings
+        2. Generative caption training
+
+        Args:
+            pixel_values: Image input tensor [batch_size, channels, height, width]
+            input_ids: Caption token ids [batch_size, seq_len]
+            attention_mask: Attention mask for captions [batch_size, seq_len]
+
+        Returns:
+            Tuple of (image_embeddings, text_embeddings, generative_loss)
+        """
+        # Extract vision features and transform to language model dimension
+        vit_embeds = self.extract_feature(pixel_values)
+        image_embeds = self.mlp1(vit_embeds)
+
+        batch_size = pixel_values.shape[0]
+        num_image_tokens = vit_embeds.shape[1]
+
+        # Get caption embeddings
+        caption_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+        # Expand query embeddings
+        query_embeds = self.contrastive_query_embeds.expand(batch_size, -1, -1)
+
+        # For contrastive learning - combine all embeddings
+        contrastive_embeds = torch.cat([image_embeds, query_embeds, caption_embeds], dim=1)
+
+        # Create attention masks for contrastive path
+        image_attention = torch.ones(
+            (batch_size, num_image_tokens),
+            dtype=torch.long,
+            device=image_embeds.device
+        )
+        query_attention = torch.ones(
+            (batch_size, query_embeds.shape[1]),
+            dtype=torch.long,
+            device=image_embeds.device
+        )
+        contrastive_attention_mask = torch.cat([image_attention, query_attention, attention_mask], dim=1)
+
+
+        ignore_tokens = torch.full(
+            (batch_size, num_image_tokens + query_embeds.shape[1]),
+            -100,
+            dtype=torch.long,
+            device=input_ids.device
+        )
+        gen_labels = torch.cat([ignore_tokens, input_ids], dim=1)
+
+        # Forward pass for contrastive learning
+        outputs = self.language_model(
+            inputs_embeds=contrastive_embeds,
+            attention_mask=contrastive_attention_mask,
+            output_hidden_states=True,
+            labels=gen_labels,
+            return_dict=True,
+        )
+
+        # Get embeddings for contrastive loss
+        hidden_states = outputs.hidden_states[-1]
+        image_embeddings = hidden_states[:, :num_image_tokens].mean(dim=1)
+        text_embeddings = hidden_states[:, num_image_tokens:].mean(dim=1)
+
+        # Normalize embeddings
+        image_embeddings = F.normalize(image_embeddings, p=2, dim=-1)
+        text_embeddings = F.normalize(text_embeddings, p=2, dim=-1)
+
+        generative_loss = outputs.loss
+
+        return image_embeddings, text_embeddings, generative_loss
+
+    def forward_generate(
+            self,
+            pixel_values: torch.FloatTensor,
+            tokenizer,
+            max_new_tokens: int = 128,
+            min_new_tokens: int = 1,
+            temperature: float = 0.7,
+            top_p: float = 0.9,
+            num_beams: int = 1,
+            do_sample: bool = True,
+    ) -> List[str]:
+        """
+        Generate captions given images using only image embeddings and query tokens.
+
+        Args:
+            pixel_values: Image input tensor [batch_size, channels, height, width]
+            tokenizer: Tokenizer for decoding
+            max_new_tokens: Maximum number of new tokens to generate
+            min_new_tokens: Minimum number of new tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling probability
+            num_beams: Number of beams for beam search
+            do_sample: Whether to use sampling or greedy decoding
+        """
+        # Extract vision features and transform to language model dimension
+        vit_embeds = self.extract_feature(pixel_values)
+        image_embeds = self.mlp1(vit_embeds)
+
+        batch_size = pixel_values.shape[0]
+
+        # Expand query embeddings
+        query_embeds = self.contrastive_query_embeds.expand(batch_size, -1, -1)
+
+        # Concatenate image embeddings with query embeddings
+        inputs_embeds = torch.cat([image_embeds, query_embeds], dim=1)
+
+        # Create attention mask
+        attention_mask = torch.ones(
+            (batch_size, inputs_embeds.shape[1]),
+            dtype=torch.long,
+            device=inputs_embeds.device
+        )
+
+        # Configure generation parameters
+        gen_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            top_p=top_p,
+            num_beams=num_beams,
+            pad_token_id=tokenizer.pad_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        # Generate caption tokens
+        outputs = self.language_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            generation_config=gen_config,
+            return_dict_in_generate=True,
+        )
+
+        # Decode generated tokens to text
+        generated_texts = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
+
+        return generated_texts
 
     def classify(self, features):
         return self.fc(features)
