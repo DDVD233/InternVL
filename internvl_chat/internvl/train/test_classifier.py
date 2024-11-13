@@ -924,7 +924,9 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     rebuild_vocab = True
     if load_checkpoint is not None:
-        rebuild_vocab = False
+        checkpoint_dir = os.path.dirname(load_checkpoint)
+        if 'vocabs.json' in os.listdir(checkpoint_dir):  # Not a pretrain model
+            rebuild_vocab = False
     if 'internvl' in model_path.lower():
         # dynamic_image_size = True
         image_size = 448
@@ -1084,10 +1086,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     logger.info(f'Trainable parameters: {trainable_params}')
     logger.info(f'Total steps: {total_steps}, Warmup steps: {warmup_steps}')
 
-    # save vocab to output path
-    meta_train_name = os.path.basename(meta_train_path)
-    meta_name = meta_train_name.replace('_train', '').replace('.json', '')
-    with open(os.path.join(output_path, f'{meta_name}_vocabs.json'), 'w') as f:
+    with open(os.path.join(output_path, f'vocabs.json'), 'w') as f:
         json.dump(train_dataset.vocabs, f)
 
     # Train the model
