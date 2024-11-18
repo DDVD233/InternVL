@@ -28,13 +28,19 @@ from sklearn.metrics import confusion_matrix, f1_score, hamming_loss, roc_auc_sc
 from torch import nn
 from torch.utils.data import Dataset, Subset
 from transformers import get_cosine_schedule_with_warmup
-from internvl.train.soap import SOAP
-# from internvl.train.sf_soap import SFPaLMForeachSOAP
 from heavyball import PrecondScheduleForeachSOAP
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def set_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def collate_fn(batch):
@@ -116,6 +122,8 @@ def collate_fn(batch):
     max_question_length = max(len(q) for q in questions)
     padded_questions = [q.ljust(max_question_length) for q in questions]
     targets = [item['targets'] for item in batch]
+    modalities = [item['modality'] for item in batch]
+    positive_modalities = [item['positive_modality'] for item in batch] if 'positive_modality' in batch[0] else None
 
     return_dict = {
         'pixel_values': pixel_values,
@@ -127,7 +135,9 @@ def collate_fn(batch):
         'caption': captions,
         'targets': targets,
         'dataset': dataset,
-        'negative_indices': padded_negative_indices
+        'negative_indices': padded_negative_indices,
+        'modality': modalities,
+        'positive_modality': positive_modalities
     }
 
     return return_dict
@@ -314,6 +324,7 @@ class LazySupervisedDataset(Dataset):
 
         vocabs = []
         data_items = []
+        self.unique_modalities = set()
         with open(meta_path, 'r') as f:
             meta = json.load(f)
         for ds_name, ds_meta in meta.items():
@@ -335,11 +346,17 @@ class LazySupervisedDataset(Dataset):
                     vocabs.extend(targets)
                     data['targets'] = targets
                     data['dataset'] = ds_name
+
+                    # Extract and standardize modality
                     modality = ds_name.split('_')[0]  # chest, derm, mammo, etc
-                    modality = modality.replace('chest', 'chest x-ray').replace('mammo', 'mammography').replace('derm',
-                                                                                                                'dermoscopy')
-                    modality = modality.replace('mri', 'MRI').replace('ct', 'CT')
+                    modality = modality.replace('chest', 'chest x-ray') \
+                        .replace('mammo', 'mammography') \
+                        .replace('derm', 'dermoscopy') \
+                        .replace('mri', 'MRI') \
+                        .replace('ct', 'CT')
                     data['modality'] = modality
+                    self.unique_modalities.add(modality)
+
                     data['caption'] = modality + ', ' + target
                     if 'images' in data:
                         data_items.append(data)
@@ -347,6 +364,8 @@ class LazySupervisedDataset(Dataset):
                         # Oversampling 20x for video data
                         data_items.extend([data] * 20)
                     bar.update(1)
+
+        logger.info(f"Found modalities: {sorted(list(self.unique_modalities))}")
 
         # meta_name = os.path.basename(meta_path).replace('.json', '').replace('_train', '').replace('_valid', '')
         vocab_path = os.path.join(output_path, f'vocabs.json')
@@ -397,6 +416,10 @@ class LazySupervisedDataset(Dataset):
         self.min_dynamic_patch = min_dynamic_patch
         self.max_dynamic_patch = max_dynamic_patch
         gc.collect()
+
+    def get_modalities(self):
+        """Return the list of unique modalities in the dataset."""
+        return sorted(list(self.unique_modalities))
 
     def build_vocab(self, vocab_path, vocabs):
         vocabs = list(set(vocabs))
@@ -502,6 +525,7 @@ class LazySupervisedDataset(Dataset):
             question=question,
             caption=data_item['caption'],
             dataset=dataset,
+            modality=data_item['modality']
         )
         return ret
 
@@ -567,6 +591,8 @@ class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
             'question': anchor_ret['question'],
             'dataset': anchor_ret['dataset'],
             'caption': anchor_ret['caption'],
+            'modality': anchor_ret['modality'],
+            'positive_modality': positive_ret['modality']
         }
 
 
@@ -759,7 +785,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             datasets = batch['dataset']
-            outputs = model.forward_vision(pixel_values, attention_mask)
+            modalities = batch['modality']
+            outputs = model.forward_vision(pixel_values, attention_mask, modalities=modalities)
             # outputs = torch.sigmoid(outputs)
 
             for output, label, ds in zip(outputs, labels, datasets):
@@ -906,7 +933,8 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
                      eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0,
-                     few_shot=False, shots_per_class=32):
+                     few_shot=False, shots_per_class=32, all_separate=False, eval_every=2000):
+    set_random_seed(42)
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
@@ -940,6 +968,9 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     elif 'swintransformer' in model_path.lower():
         image_size = 192
         max_dynamic_patch = 8
+    elif 'convnextv2-large' in model_path.lower():
+        image_size = 384
+        max_dynamic_patch = 1
     else:
         # dynamic_image_size = False
         image_size = 224
@@ -1003,6 +1034,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             model_name="microsoft/swinv2-large-patch4-window12-192-22k"
         ).cuda()
         model = model.to(torch.bfloat16)
+    elif all_separate:
+        modalities = train_dataset.get_modalities()
+        model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
+                                                  torch_dtype=torch.bfloat16, all_separate=True, modalities=modalities)
+        model.init_encoder_array()
     else:
         model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                                   torch_dtype=torch.bfloat16)
@@ -1065,7 +1101,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
     # loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=train_dataset.pos_weight.cuda())
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     optimizer = PrecondScheduleForeachSOAP(model.parameters(), lr=lr, weight_decay=wd)
-    # optimizer = SFPaLMForeachSOAP(model.parameters(), lr=lr * 10, weight_decay=wd, warmup_steps=warmup_steps)
+    # optimizer = ForeachDelayedPSGD(model.parameters(), lr=lr, weight_decay=wd)
     # optimizer.train()
 
     # Initialize the learning rate scheduler
@@ -1100,8 +1136,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             labels = batch['labels'].cuda().to(model.dtype)
             negative_indices = batch['negative_indices'].cuda()
             datasets = batch['dataset']
+            modalities = batch['modality']
+            positive_modalities = batch['positive_modality']
 
-            features = model.forward_vision(pixel_values, attention_mask=attention_mask, classify=False)
+            features = model.forward_vision(pixel_values, attention_mask=attention_mask,
+                                            classify=False, modalities=modalities)
             outputs = model.classify(features)
 
             classification_loss = loss_fn(outputs, labels, datasets)
@@ -1109,7 +1148,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                 contr_loss = torch.tensor(0.0, device=features.device)
             else:
                 positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
-                                                        classify=False)
+                                                        classify=False, modalities=positive_modalities)
                 contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
 
             # Backward pass
@@ -1136,13 +1175,18 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             wandb.log(stats)
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
-            if step % 500 == 0 and step > 0:
+            if step % eval_every == 0 and step > 0:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000, dataloader=train_val_loader)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
                                     num_samples=-1, dataloader=val_dataloader)
-            if step % 1000 == 0:
+
+                # Save the model
                 torch.save(model.state_dict(), os.path.join(output_path, f'model_{step}.pt'))
+                # Leave only 3
+                for file in os.listdir(output_path):
+                    if 'model_' in file and int(file.split('_')[1].split('.')[0]) < step - 3000:
+                        os.remove(os.path.join(output_path, file))
             step += 1
 
     # Save the model via huggingface
@@ -1164,10 +1208,12 @@ if __name__ == '__main__':
     arg_parser.add_argument('--load_checkpoint', type=str, default=None)
     arg_parser.add_argument('--no_contrastive', action='store_true')
     arg_parser.add_argument('--unfreeze_vit_layers', type=int, default=0)
+    arg_parser.add_argument('--eval_every', type=int, default=2000)
     arg_parser.add_argument('--few_shot', action='store_true',
                             help='Enable few-shot learning mode')
     arg_parser.add_argument('--shots_per_class', type=int, default=8,
                             help='Number of samples per class in few-shot mode')
+    arg_parser.add_argument('--all_separate', action='store_true', help='Use all separate model')
 
     args = arg_parser.parse_args()
     train_classifier(model_path=args.model_path, output_path=args.output_path,
@@ -1175,4 +1221,5 @@ if __name__ == '__main__':
                      meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path,
                      eval_only=args.eval_only, load_checkpoint=args.load_checkpoint,
                      no_contrastive=args.no_contrastive, unfreeze_vit_layers=args.unfreeze_vit_layers,
-                     few_shot=args.few_shot, shots_per_class=args.shots_per_class)
+                     few_shot=args.few_shot, shots_per_class=args.shots_per_class, all_separate=args.all_separate,
+                     eval_every=args.eval_every)
