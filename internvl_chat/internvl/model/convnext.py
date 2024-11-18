@@ -16,6 +16,7 @@ class ConvNextV2Classifier(PreTrainedModel):
         super().__init__(config)
 
         self.vision_model = ConvNextV2Model(config)
+        self.vision_model = self.vision_model.to(torch.bfloat16)
         self.img_size = 224
         hidden_size = config.hidden_sizes[-1]  # Use the last stage's hidden size
 
@@ -35,7 +36,7 @@ class ConvNextV2Classifier(PreTrainedModel):
 
         logger.info(f'Initialized ConvNextV2Classifier with output size: {vision_output_size}')
 
-    def forward_vision(self, pixel_values, attention_mask=None, classify=True):
+    def forward_vision(self, pixel_values, attention_mask=None, classify=True, **kwargs):
         """
         Forward pass through the vision model.
 

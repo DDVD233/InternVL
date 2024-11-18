@@ -3,6 +3,7 @@
 # Copyright (c) 2024 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+import copy
 import os
 import warnings
 from functools import partial
@@ -28,6 +29,7 @@ from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
 
 logger = logging.get_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def version_cmp(v1, v2, op='eq'):
@@ -145,7 +147,7 @@ class InternVLChatModel(PreTrainedModel):
     _supports_flash_attn_2 = True
 
     def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None,
-                 vision_only=False, vision_output_size=-1):
+                 vision_only=False, vision_output_size=-1, all_separate=False, modalities=None):
         super().__init__(config)
 
         assert version_cmp(transformers.__version__, '4.37.0', 'ge')
@@ -158,6 +160,8 @@ class InternVLChatModel(PreTrainedModel):
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
         self.llm_arch_name = config.llm_config.architectures[0]
+        self.all_separate = all_separate
+        self.modalities = modalities
 
         logger.info(f'num_image_token: {self.num_image_token}')
         logger.info(f'ps_version: {self.ps_version}')
@@ -231,6 +235,35 @@ class InternVLChatModel(PreTrainedModel):
         if config.use_llm_lora:
             self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
 
+    def init_encoder_array(self):
+        """Initialize separate encoders for each modality."""
+        if not self.all_separate or not self.modalities:
+            logger.warning("Separate encoders are not enabled or modalities are not provided.")
+            return
+
+        logger.info(f"Initializing separate encoders for modalities: {self.modalities}")
+
+        # Create array of encoders
+        self.encoder_array = nn.ModuleList([
+            copy.deepcopy(self.vision_model) for _ in range(len(self.modalities))
+        ])
+
+        # Create mapping from modality to encoder index
+        self.modality_to_encoder = {
+            modality: idx for idx, modality in enumerate(self.modalities)
+        }
+
+        # Load weights from original model to all encoders
+        original_state_dict = self.vision_model.state_dict()
+        for encoder in self.encoder_array:
+            encoder.load_state_dict(original_state_dict)
+
+        logger.info(f"Initialized {len(self.encoder_array)} separate encoders")
+        logger.info(f"Modality to encoder mapping: {self.modality_to_encoder}")
+
+        # Remove the original vision model to save memory
+        self.vision_model = None
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], *model_args, **kwargs):
         # First load the model normally
@@ -294,39 +327,105 @@ class InternVLChatModel(PreTrainedModel):
                 elif 'bias' in name:
                     nn.init.constant_(param, 0)
 
-    def forward_vision(self, pixel_values, attention_mask=None, classify=True):
+    def forward_vision(self, pixel_values, attention_mask=None, classify=True, modalities=None):
+        """Forward pass with support for multiple encoders."""
         assert self.vision_only, "This method is only available in vision_only mode."
+
+        if not self.all_separate or not modalities:
+            # Use original forward_vision logic if not using separate encoders
+            return self._forward_vision_single(
+                self.vision_model,
+                pixel_values,
+                attention_mask,
+                classify
+            )
+
+        # Group samples by modality
+        b, n, c, h, w = pixel_values.shape
+        batch_indices = torch.arange(b, device=pixel_values.device)
+        features_list = []
+
+        # Process each modality separately
+        for modality in self.modalities:
+            # Find samples belonging to this modality
+            modality_mask = torch.tensor(
+                [m == modality for m in modalities],
+                device=pixel_values.device
+            )
+            if not modality_mask.any():
+                continue
+
+            # Get encoder for this modality
+            encoder_idx = self.modality_to_encoder[modality]
+            encoder = self.encoder_array[encoder_idx]
+
+            # Select samples for this modality
+            modality_indices = batch_indices[modality_mask]
+            modality_pixels = pixel_values[modality_mask]
+            modality_attention = attention_mask[modality_mask] if attention_mask is not None else None
+
+            # Process samples with corresponding encoder
+            modality_features = self._forward_vision_single(
+                encoder,
+                modality_pixels,
+                modality_attention,
+                classify=False  # We'll classify after combining all features
+            )
+
+            # Store features in the original batch order
+            features = torch.zeros(
+                b,
+                modality_features.size(1),
+                device=modality_features.device,
+                dtype=modality_features.dtype
+            )
+            features[modality_mask] = modality_features
+            features_list.append(features)
+
+        # Combine features from all modalities
+        if len(features_list) > 1:
+            # Sum up features where we have them
+            combined_features = torch.stack(features_list).sum(0)
+        else:
+            combined_features = features_list[0]
+
+        if classify:
+            return self.classify(combined_features)
+        else:
+            return combined_features
+
+    def _forward_vision_single(self, vision_model, pixel_values, attention_mask=None, classify=True):
+        """Helper method for processing a single modality."""
         b, n, c, h, w = pixel_values.shape
         pixel_values = pixel_values.view(b * n, c, h, w)
-        pixel_values = pixel_values.to(self.vision_model.dtype)
-        features = self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=False,
-                return_dict=True).last_hidden_state[:, 1:, :]
+        pixel_values = pixel_values.to(vision_model.dtype)
+
+        features = vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True
+        ).last_hidden_state[:, 1:, :]
+
         b_n, np, c = features.shape
         features = features.view(b, n, np, c)
 
         if attention_mask is not None:
-            # Apply attention mask
             attention_mask = attention_mask.to(features.dtype)
-            mask = attention_mask.unsqueeze(-1).unsqueeze(-1)  # Shape: (b, n, 1, 1)
+            mask = attention_mask.unsqueeze(-1).unsqueeze(-1)
             features = features * mask
 
-        # Apply attention pooling across frames
         pooled_features = []
         for i in range(b):
             if attention_mask is not None:
-                # Convert to int and move to CPU for indexing
                 valid_length = int(attention_mask[i].sum().item())
-                frame_features = features[i, :valid_length]  # Only use valid frames
+                frame_features = features[i, :valid_length]
             else:
-                frame_features = features[i]  # Use all frames if no mask
-            pooled = self.clip_projector(frame_features)  # Shape: (n, clip_embed_dim)
-            pooled = pooled.mean(0)  # Shape: (clip_embed_dim,)
+                frame_features = features[i]
+            pooled = self.clip_projector(frame_features)
+            pooled = pooled.mean(0)
             pooled_features.append(pooled)
 
         features = torch.stack(pooled_features)
-
         if classify:
             return self.classify(features)
         else:
