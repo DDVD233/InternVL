@@ -129,7 +129,7 @@ class FCMAE(nn.Module):
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        mask = torch.ones([N, L], device=x.device)
+        mask = torch.ones([N, L], device=x.device, dtype=torch.bfloat16)
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
@@ -177,21 +177,29 @@ class FCMAE(nn.Module):
     def forward_loss(self, imgs: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Compute reconstruction loss
         Args:
-            imgs: original images
-            pred: reconstructed patches
-            mask: binary mask
+            imgs: original images (N, 3, H, W)
+            pred: reconstructed patches (N, p*p*3, h, w)
+            mask: binary mask (N, L)
         Returns:
             loss: reconstruction loss
         """
+        # Reshape pred from (N, p*p*3, h, w) to (N, L, p*p*3)
+        # where L = h * w is the number of patches
+        N, _, h, w = pred.shape
+        pred = pred.permute(0, 2, 3, 1)  # (N, h, w, p*p*3)
+        pred = pred.reshape(N, h * w, -1)  # (N, L, p*p*3)
+
+        # Get target patches
         target = self.patchify(imgs)
+
         if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6) ** .5
 
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)
-        loss = (loss * mask).sum() / mask.sum()
+        loss = loss.mean(dim=-1)  # mean loss per patch
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
     def forward(self, imgs: torch.Tensor, mask_ratio: float = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -292,7 +300,7 @@ def train_one_epoch(
             'loss': loss.item(),
             'avg_loss': avg_loss,
             'lr': current_lr,
-            'num_images': batch['num_images'].mean().item(),
+            'num_images': batch['num_images'].float().mean().item(),
             'video_ratio': batch['is_video'].float().mean().item(),
         }
 
@@ -395,13 +403,13 @@ def train_model(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_pretrain_local.json',
+    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json',
                         help='Path to training metadata')
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--model_path', type=str, default='facebook/convnextv2-base-22k-224',
                         help='Path to ConvNeXtV2 model')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--bs', type=int, default=32, help='Batch size')
+    parser.add_argument('--bs', type=int, default=128, help='Batch size')
     parser.add_argument('--wd', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--output_path', type=str, default='/home/dvd/data/outputs/convnext_pretrain',
                         help='Path to save checkpoints')
@@ -427,11 +435,13 @@ if __name__ == '__main__':
         dataset=dataset,
         batch_size=args.bs,
         shuffle=True,
-        num_workers=16
+        num_workers=64
     )
 
     # Initialize models and optimizer
-    backbone = ConvNextV2Classifier.from_pretrained(args.model_path)
+    backbone = ConvNextV2Classifier.from_pretrained(args.model_path,
+                                                    vision_output_size=1)
+    backbone = backbone.to(torch.bfloat16)
     model = FCMAE(
         backbone=backbone,
         decoder_depth=1,
@@ -439,6 +449,7 @@ if __name__ == '__main__':
         patch_size=32,
         mask_ratio=0.6
     )
+    model = model.to(torch.bfloat16)
 
     # Setup optimizer and scheduler
     optimizer = PrecondScheduleForeachSOAP(model.parameters(), lr=args.lr, weight_decay=args.wd)
