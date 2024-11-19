@@ -7,9 +7,13 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+import logging
 
 from internvl.train.dataset import build_transform
-from internvl.train.pretrain import logger
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class PretrainingDataset(Dataset):
