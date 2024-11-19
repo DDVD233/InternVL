@@ -349,11 +349,11 @@ class LazySupervisedDataset(Dataset):
 
                     # Extract and standardize modality
                     modality = ds_name.split('_')[0]  # chest, derm, mammo, etc
-                    modality = modality.replace('chest', 'chest x-ray') \
-                        .replace('mammo', 'mammography') \
-                        .replace('derm', 'dermoscopy') \
-                        .replace('mri', 'MRI') \
-                        .replace('ct', 'CT')
+                    # modality = modality.replace('chest', 'chest x-ray') \
+                    #     .replace('mammo', 'mammography') \
+                    #     .replace('derm', 'dermoscopy') \
+                    #     .replace('mri', 'MRI') \
+                    #     .replace('ct', 'CT')
                     data['modality'] = modality
                     self.unique_modalities.add(modality)
 
@@ -596,9 +596,61 @@ class ContrastiveLazySupervisedDataset(LazySupervisedDataset):
         }
 
 
-class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
-    """Dataset for few-shot supervised fine-tuning with contrastive learning."""
+def filter_by_modality(data_items, test_modality, in_mod_pct, out_mod_pct, few_shot_datasets, vocabs):
+    """
+    Filter data items based on modality percentages while preserving few-shot datasets.
 
+    Args:
+        data_items: List of data items
+        test_modality: Target modality to filter
+        in_mod_pct: Percentage of in-modality data to keep (0.0-1.0)
+        out_mod_pct: Percentage of out-of-modality data to keep (0.0-1.0)
+        few_shot_datasets: List of dataset names to preserve
+        vocabs: List of vocabulary items for stratification
+    """
+    if test_modality is None:
+        return data_items
+
+    # Organize data by modality, dataset, and label
+    modality_dataset_label_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for item in tqdm.tqdm(data_items, desc='Organizing data for filtering'):
+        dataset = item['dataset']
+        modality = item['modality']
+        label_tuple = tuple(item['labels'])
+        modality_dataset_label_data[modality][dataset][label_tuple].append(item)
+
+    filtered_items = []
+
+    # Process each modality
+    for modality, dataset_dict in modality_dataset_label_data.items():
+        for dataset, label_dict in dataset_dict.items():
+            # Skip filtering for few-shot datasets
+            if dataset in few_shot_datasets and modality == test_modality:
+                for items in label_dict.values():
+                    filtered_items.extend(items)
+                continue
+
+            # Determine percentage to keep based on modality
+            keep_pct = in_mod_pct if modality == test_modality else out_mod_pct
+
+            # If keeping all data, skip filtering
+            if keep_pct >= 1.0:
+                for items in label_dict.values():
+                    filtered_items.extend(items)
+                continue
+            elif keep_pct <= 0.0:
+                continue
+
+            # Stratified sampling for each label
+            for label_tuple, items in label_dict.items():
+                num_to_keep = max(1, int(len(items) * keep_pct))
+                kept_items = random.sample(items, num_to_keep)
+                filtered_items.extend(kept_items)
+
+    return filtered_items
+
+
+class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
     def __init__(
             self,
             meta_path,
@@ -606,6 +658,9 @@ class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
             output_path,
             few_shot_datasets=None,
             shots_per_class=32,
+            test_modality=None,
+            in_mod_pct=1.0,
+            out_mod_pct=1.0,
             image_size=448,
             is_train=False,
             pad2square=False,
@@ -640,6 +695,21 @@ class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
 
         self.few_shot_datasets = few_shot_datasets or []
         self.shots_per_class = shots_per_class
+
+        if test_modality is not None:
+            logger.info(f'Filtering data based on modality: {test_modality}')
+            logger.info(f'In-modality percentage: {in_mod_pct}')
+            logger.info(f'Out-modality percentage: {out_mod_pct}')
+
+        # Apply modality filtering
+        self.data_items = filter_by_modality(
+            self.data_items,
+            test_modality,
+            in_mod_pct,
+            out_mod_pct,
+            self.few_shot_datasets,
+            self.vocabs
+        )
 
         if self.few_shot_datasets and self.is_train:
             logger.info(f'Applying few-shot sampling for datasets: {few_shot_datasets}')
@@ -676,26 +746,47 @@ class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
             # shuffle data
             self.rng.shuffle(self.data_items)
 
-            # Rebuild contrastive learning indices
-            self.dataset_label_to_indices = defaultdict(dict)
-            for idx, item in enumerate(self.data_items):
-                label_tuple = tuple(item['labels'])
-                dataset = item['dataset']
-                if label_tuple not in self.dataset_label_to_indices[dataset]:
-                    self.dataset_label_to_indices[dataset][label_tuple] = []
-                self.dataset_label_to_indices[dataset][label_tuple].append(idx)
+        # Update indices and label sets for contrastive learning
+        self.rebuild_indices()
 
-            # Rebuild label set and different labels mapping
-            self.label_set = set(tuple(item['labels']) for item in self.data_items)
-            self.different_labels = {
-                label: list(self.label_set - {label}) for label in self.label_set
-            }
+        # Log dataset statistics
+        self._log_dataset_statistics()
 
-            # Log dataset statistics
-            logger.info(f'Dataset size after few-shot processing: {len(self.data_items)}')
+    def rebuild_indices(self):
+        """Rebuild indices for contrastive learning after data filtering"""
+        self.dataset_label_to_indices = defaultdict(dict)
+        for idx, item in enumerate(self.data_items):
+            label_tuple = tuple(item['labels'])
+            dataset = item['dataset']
+            if label_tuple not in self.dataset_label_to_indices[dataset]:
+                self.dataset_label_to_indices[dataset][label_tuple] = []
+            self.dataset_label_to_indices[dataset][label_tuple].append(idx)
+
+        # Rebuild label set and different labels mapping
+        self.label_set = set(tuple(item['labels']) for item in self.data_items)
+        self.different_labels = {
+            label: list(self.label_set - {label}) for label in self.label_set
+        }
+
+    def _log_dataset_statistics(self):
+        """Log detailed dataset statistics after filtering"""
+        logger.info(f'Dataset size after processing: {len(self.data_items)}')
+
+        # Count samples by modality
+        modality_counts = defaultdict(int)
+        for item in self.data_items:
+            modality_counts[item['modality']] += 1
+
+        logger.info("Samples per modality:")
+        for modality, count in modality_counts.items():
+            logger.info(f"  {modality}: {count}")
+
+        # Count samples in few-shot datasets
+        if self.few_shot_datasets:
+            logger.info("\nSamples in few-shot datasets:")
             for dataset in self.few_shot_datasets:
                 count = sum(1 for item in self.data_items if item['dataset'] == dataset)
-                logger.info(f'Samples in few-shot dataset {dataset}: {count}')
+                logger.info(f"  {dataset}: {count}")
 
 
 def contrastive_loss(anchor, positive, negative_indices, temperature=0.07):
@@ -933,13 +1024,14 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      meta_train_path='../../../processing/meta_train.json',
                      meta_valid_path='../../../processing/meta_valid.json',
                      eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0,
-                     few_shot=False, shots_per_class=32, all_separate=False, eval_every=2000):
+                     few_shot=False, shots_per_class=32, all_separate=False, eval_every=2000,
+                     test_modality=None, in_mod_pct=1.0, out_mod_pct=1.0):
     set_random_seed(42)
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    wandb.init(project='high_modality')
+    wandb.init(project='high_modality', config=locals(), name=os.path.basename(output_path))
 
     # Create and setup file handler
     log_file = os.path.join(output_path, 'train.log')
@@ -977,33 +1069,59 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         max_dynamic_patch = 2
     logger.info(f'Image size: {image_size}, Max dynamic patch: {max_dynamic_patch}')
 
-    few_shot_datasets = []
     if few_shot:
+        few_shot_datasets = []
         with open(meta_valid_path, 'r') as f:
             valid_meta = json.load(f)
             few_shot_datasets = list(valid_meta.keys())
         logger.info(f'Few-shot datasets from validation: {few_shot_datasets}')
-
-        train_dataset = FewShotContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
-                                                                num_image_token=256, rebuild_vocab=rebuild_vocab,
-                                                                is_train=True, dynamic_image_size=False,
-                                                                image_size=image_size,
-                                                                max_dynamic_patch=max_dynamic_patch,
-                                                                few_shot_datasets=few_shot_datasets,
-                                                                shots_per_class=shots_per_class)
     else:
-        train_dataset = ContrastiveLazySupervisedDataset(meta_train_path, output_path=output_path,
-                                                         num_image_token=256, rebuild_vocab=rebuild_vocab,
-                                                         is_train=True, dynamic_image_size=False,
-                                                         image_size=image_size, max_dynamic_patch=max_dynamic_patch)
+        few_shot_datasets = None
 
+    train_dataset = FewShotContrastiveLazySupervisedDataset(
+        meta_train_path,
+        output_path=output_path,
+        num_image_token=256,
+        rebuild_vocab=rebuild_vocab,
+        is_train=True,
+        dynamic_image_size=False,
+        image_size=image_size,
+        max_dynamic_patch=max_dynamic_patch,
+        few_shot_datasets=few_shot_datasets,
+        shots_per_class=shots_per_class,
+        test_modality=test_modality,
+        in_mod_pct=in_mod_pct,
+        out_mod_pct=out_mod_pct
+    )
     train_val_dataset = LazySupervisedDataset(meta_train_path, num_image_token=256,
                                               output_path=output_path, dynamic_image_size=False,
                                               is_train=False, image_size=image_size,
                                               max_dynamic_patch=max_dynamic_patch)
-    val_dataset = LazySupervisedDataset(meta_valid_path, num_image_token=256,
-                                        output_path=output_path, dynamic_image_size=False,
-                                        is_train=False, image_size=image_size, max_dynamic_patch=max_dynamic_patch)
+
+    # Filter validation dataset if test_modality is specified
+    if test_modality is not None:
+        val_dataset = FewShotContrastiveLazySupervisedDataset(
+            meta_valid_path,
+            output_path=output_path,
+            num_image_token=256,
+            is_train=False,
+            dynamic_image_size=False,
+            image_size=image_size,
+            max_dynamic_patch=max_dynamic_patch,
+            test_modality=test_modality,
+            in_mod_pct=1.0,
+            out_mod_pct=0.0
+        )
+    else:
+        val_dataset = LazySupervisedDataset(
+            meta_valid_path,
+            num_image_token=256,
+            output_path=output_path,
+            dynamic_image_size=False,
+            is_train=False,
+            image_size=image_size,
+            max_dynamic_patch=max_dynamic_patch
+        )
     vocab_size = len(train_dataset.vocabs)
 
     # Load the model
@@ -1175,7 +1293,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             wandb.log(stats)
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
-            if step % eval_every == 0 and step > 0:
+            if (step % eval_every == 0 and step > 0) or step == 300:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000, dataloader=train_val_loader)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
@@ -1214,12 +1332,33 @@ if __name__ == '__main__':
     arg_parser.add_argument('--shots_per_class', type=int, default=8,
                             help='Number of samples per class in few-shot mode')
     arg_parser.add_argument('--all_separate', action='store_true', help='Use all separate model')
+    arg_parser.add_argument('--test_modality', type=str, default=None,
+                            help='Modality to test on (e.g., mammography, chest x-ray)')
+    arg_parser.add_argument('--in_mod_pct', type=float, default=1.0,
+                            help='Percentage of in-modality data to keep (0.0-1.0)')
+    arg_parser.add_argument('--out_mod_pct', type=float, default=1.0,
+                            help='Percentage of out-of-modality data to keep (0.0-1.0)')
 
     args = arg_parser.parse_args()
-    train_classifier(model_path=args.model_path, output_path=args.output_path,
-                     lr=args.lr, wd=args.wd, bs=args.bs, epochs=args.epochs, freeze_vision=args.freeze_vision,
-                     meta_train_path=args.meta_train_path, meta_valid_path=args.meta_valid_path,
-                     eval_only=args.eval_only, load_checkpoint=args.load_checkpoint,
-                     no_contrastive=args.no_contrastive, unfreeze_vit_layers=args.unfreeze_vit_layers,
-                     few_shot=args.few_shot, shots_per_class=args.shots_per_class, all_separate=args.all_separate,
-                     eval_every=args.eval_every)
+    train_classifier(
+        model_path=args.model_path,
+        output_path=args.output_path,
+        lr=args.lr,
+        wd=args.wd,
+        bs=args.bs,
+        epochs=args.epochs,
+        freeze_vision=args.freeze_vision,
+        meta_train_path=args.meta_train_path,
+        meta_valid_path=args.meta_valid_path,
+        eval_only=args.eval_only,
+        load_checkpoint=args.load_checkpoint,
+        no_contrastive=args.no_contrastive,
+        unfreeze_vit_layers=args.unfreeze_vit_layers,
+        few_shot=args.few_shot,
+        shots_per_class=args.shots_per_class,
+        all_separate=args.all_separate,
+        eval_every=args.eval_every,
+        test_modality=args.test_modality,
+        in_mod_pct=args.in_mod_pct,
+        out_mod_pct=args.out_mod_pct
+    )
