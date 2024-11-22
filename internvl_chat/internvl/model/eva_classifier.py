@@ -88,7 +88,8 @@ class EVA02Classifier(nn.Module):
             self,
             pixel_values: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            classify: bool = True
+            classify: bool = True,
+            **kwargs
     ) -> torch.Tensor:
         """
         Forward pass through the vision model.
@@ -132,7 +133,7 @@ class EVA02Classifier(nn.Module):
 
     def to(self, *args, **kwargs):
         """Handle moving model to device and changing dtype"""
-        self = super().to(*args, **kwargs)
+        super().to(*args, **kwargs)
         self.vision_model = self.vision_model.to(*args, **kwargs)
         self.fc = self.fc.to(*args, **kwargs)
         # Update dtype if it's in the arguments
