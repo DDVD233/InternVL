@@ -21,13 +21,15 @@ from internvl.model.convnext import ConvNextV2Classifier
 from internvl.model.eva_classifier import EVA02Classifier
 from internvl.model.swin_transformer import SwinV2Classifier
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
+from internvl.model.internvl_chat.configuration_internvl_chat import InternVLChatConfig
 from internvl.model.sbb_vit import ViTSBBClassifier
 from internvl.train.dataset import build_transform, dynamic_preprocess
+from internvl.model.internvl_chat.internvl_moe import MoEVisionModel
 from PIL import Image
 from sklearn.metrics import confusion_matrix, f1_score, hamming_loss, roc_auc_score
 from torch import nn
 from torch.utils.data import Dataset, Subset
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, AutoConfig
 from heavyball import PrecondScheduleForeachSOAP
 
 warnings.filterwarnings('ignore')
@@ -1025,7 +1027,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                      meta_valid_path='../../../processing/meta_valid.json',
                      eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0,
                      few_shot=False, shots_per_class=32, all_separate=False, eval_every=2000,
-                     test_modality=None, in_mod_pct=1.0, out_mod_pct=1.0):
+                     test_modality=None, in_mod_pct=1.0, out_mod_pct=1.0, moe=-1):
     set_random_seed(42)
     if not os.path.exists(output_path):
         os.makedirs(output_path)
@@ -1157,6 +1159,11 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                                   torch_dtype=torch.bfloat16, all_separate=True, modalities=modalities)
         model.init_encoder_array()
+    elif moe > 0:
+        config = InternVLChatConfig.from_pretrained(model_path).vision_config
+        config.num_experts = 4
+        model = MoEVisionModel(config=config, vision_output_size=vocab_size)
+        model.load_from_internvl(model_path)
     else:
         model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                                   torch_dtype=torch.bfloat16)
@@ -1202,7 +1209,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Calculate total steps for the scheduler
     total_steps = len(dataloader) * epochs
-    warmup_steps = 200  # 1/30 of total steps for warmup
+    warmup_steps = 200
 
     dataset_label_indices = build_dataset_label_indices(train_dataset.data_items, train_dataset.vocabs)
 
@@ -1259,6 +1266,10 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
             features = model.forward_vision(pixel_values, attention_mask=attention_mask,
                                             classify=False, modalities=modalities)
+            if isinstance(model, MoEVisionModel):
+                features, load_loss = features
+            else:
+                load_loss = torch.tensor(0.0, device=features.device)
             outputs = model.classify(features)
 
             classification_loss = loss_fn(outputs, labels, datasets)
@@ -1267,10 +1278,13 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             else:
                 positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
                                                         classify=False, modalities=positive_modalities)
+                if isinstance(model, MoEVisionModel):
+                    positive_outputs, load_loss_pos = positive_outputs
+                    load_loss += load_loss_pos
                 contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
 
             # Backward pass
-            total_loss = classification_loss + contrastive_weight * contr_loss
+            total_loss = classification_loss + contrastive_weight * contr_loss + load_loss
             total_loss.backward()
 
             # Gradient clipping
@@ -1286,6 +1300,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                 'loss': total_loss.item(),
                 'classification_loss': classification_loss.item(),
                 'contrastive_loss': contr_loss.item(),
+                'load_loss': load_loss.item(),
                 'step': step,
                 'lr': current_lr,  # Log current learning rate
                 'epoch': epoch
@@ -1338,6 +1353,8 @@ if __name__ == '__main__':
                             help='Percentage of in-modality data to keep (0.0-1.0)')
     arg_parser.add_argument('--out_mod_pct', type=float, default=1.0,
                             help='Percentage of out-of-modality data to keep (0.0-1.0)')
+    arg_parser.add_argument('--moe', type=int, default=-1,
+                            help='Number of experts for MoE model')
 
     args = arg_parser.parse_args()
     train_classifier(
@@ -1360,5 +1377,6 @@ if __name__ == '__main__':
         eval_every=args.eval_every,
         test_modality=args.test_modality,
         in_mod_pct=args.in_mod_pct,
-        out_mod_pct=args.out_mod_pct
+        out_mod_pct=args.out_mod_pct,
+        moe=args.moe
     )

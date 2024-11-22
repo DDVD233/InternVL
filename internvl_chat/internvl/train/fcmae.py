@@ -391,6 +391,8 @@ def train_model(
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
         }
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
         torch.save(checkpoint, f"{save_dir}/checkpoint_epoch{epoch}.pt")
         # remove previous checkpoint
         if epoch > 0:
@@ -403,14 +405,14 @@ def train_model(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train.json',
+    parser.add_argument('--meta_train_path', type=str, default='../../../processing/meta_train_local.json',
                         help='Path to training metadata')
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--model_path', type=str, default='facebook/convnextv2-base-22k-224',
                         help='Path to ConvNeXtV2 model')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--bs', type=int, default=128, help='Batch size')
-    parser.add_argument('--wd', type=float, default=0.01, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('--bs', type=int, default=192, help='Batch size')
+    parser.add_argument('--wd', type=float, default=0.02, help='Weight decay')
     parser.add_argument('--output_path', type=str, default='/home/dvd/data/outputs/convnext_pretrain',
                         help='Path to save checkpoints')
 
@@ -435,7 +437,8 @@ if __name__ == '__main__':
         dataset=dataset,
         batch_size=args.bs,
         shuffle=True,
-        num_workers=64
+        num_workers=64,
+        prefetch_factor=4
     )
 
     # Initialize models and optimizer
