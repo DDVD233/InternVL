@@ -227,7 +227,7 @@ class MoEVisionModel(PreTrainedModel):
         torch.nn.init.normal_(self.fc.weight, std=0.02)
         torch.nn.init.constant_(self.fc.bias, 0)
 
-    def forward_vision(self, pixel_values, attention_mask=None, classify=True):
+    def forward_vision(self, pixel_values, attention_mask=None, classify=True, **kwargs):
         """Forward pass with classification option"""
         batch_size, num_frames, channels, height, width = pixel_values.shape
         pixel_values = pixel_values.view(batch_size * num_frames, channels, height, width)
@@ -271,6 +271,9 @@ class MoEVisionModel(PreTrainedModel):
             features = self.fc(features)
 
         return features, load_loss
+
+    def classify(self, features):
+        return self.fc(features)
 
     def forward(
             self,
@@ -339,7 +342,7 @@ class MoEVisionModel(PreTrainedModel):
         # Load attention layers (they remain unchanged)
         attn_dict = {
             k: v for k, v in original_model.state_dict().items()
-            if 'attention' in k or 'norm1' in k or 'ls1' in k
+            if 'attn' in k or 'norm1' in k or 'ls1' in k
         }
         missing_keys, unexpected_keys = self.load_state_dict(attn_dict, strict=False)
 
@@ -360,8 +363,8 @@ class MoEVisionModel(PreTrainedModel):
                 noisy_state_dict = {}
                 for k, v in original_mlp_dict.items():
                     if 'weight' in k:
-                        noise = torch.randn_like(v) * noise_scale * v.std()
-                        noisy_state_dict[k] = v + noise
+                        # noise = torch.randn_like(v) * noise_scale * v.std()
+                        noisy_state_dict[k] = v
                     else:  # bias terms
                         noisy_state_dict[k] = v.clone()
 

@@ -410,9 +410,9 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--model_path', type=str, default='facebook/convnextv2-base-22k-224',
                         help='Path to ConvNeXtV2 model')
-    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--bs', type=int, default=192, help='Batch size')
-    parser.add_argument('--wd', type=float, default=0.02, help='Weight decay')
+    parser.add_argument('--wd', type=float, default=0.05, help='Weight decay')
     parser.add_argument('--output_path', type=str, default='/home/dvd/data/outputs/convnext_pretrain',
                         help='Path to save checkpoints')
 
