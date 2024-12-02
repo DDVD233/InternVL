@@ -880,9 +880,18 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
             datasets = batch['dataset']
             modalities = batch['modality']
             outputs = model.forward_vision(pixel_values, attention_mask, modalities=modalities)
+            if isinstance(model, MoEVisionModel):
+                outputs, _ = outputs
             # outputs = torch.sigmoid(outputs)
+            # if len(outputs) == 0:
+            #     logger.warning(f"Empty output for batch {index}")
+            #     logger.warning(f"Pixel values: {pixel_values}")
+            #     continue
 
             for output, label, ds in zip(outputs, labels, datasets):
+                # if outputs is not empty
+                if output.size(0) == 0:
+                    continue
                 dataset_outputs[ds].append(output.float().cpu())
                 dataset_labels[ds].append(label.float().cpu().numpy())
 
@@ -1161,9 +1170,10 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         model.init_encoder_array()
     elif moe > 0:
         config = InternVLChatConfig.from_pretrained(model_path).vision_config
-        config.num_experts = 4
+        config.num_experts = moe
         model = MoEVisionModel(config=config, vision_output_size=vocab_size)
         model.load_from_internvl(model_path)
+        model = model.to(torch.bfloat16)
     else:
         model = InternVLChatModel.from_pretrained(model_path, vision_only=True, vision_output_size=vocab_size,
                                                   torch_dtype=torch.bfloat16)
@@ -1209,7 +1219,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Calculate total steps for the scheduler
     total_steps = len(dataloader) * epochs
-    warmup_steps = 200
+    warmup_steps = 500
 
     dataset_label_indices = build_dataset_label_indices(train_dataset.data_items, train_dataset.vocabs)
 
@@ -1234,7 +1244,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
-        num_cycles=1.5
+        num_cycles=2
     )
 
     if eval_only:
@@ -1276,12 +1286,14 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             if no_contrastive:
                 contr_loss = torch.tensor(0.0, device=features.device)
             else:
-                positive_outputs = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
-                                                        classify=False, modalities=positive_modalities)
+                positive_features = model.forward_vision(positive_values, attention_mask=positive_attention_mask,
+                                                         classify=False, modalities=positive_modalities)
                 if isinstance(model, MoEVisionModel):
-                    positive_outputs, load_loss_pos = positive_outputs
+                    positive_features, load_loss_pos = positive_features
                     load_loss += load_loss_pos
-                contr_loss = contrastive_loss(features, positive_outputs, negative_indices)
+                contr_loss = contrastive_loss(features, positive_features, negative_indices)
+                positive_outputs = model.classify(positive_features)
+                classification_loss += loss_fn(positive_outputs, labels, datasets)
 
             # Backward pass
             total_loss = classification_loss + contrastive_weight * contr_loss + load_loss
@@ -1308,7 +1320,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             wandb.log(stats)
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
-            if (step % eval_every == 0 and step > 0) or step == 300:
+            if (step % eval_every == 0 and step > 0) or step == 100:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000, dataloader=train_val_loader)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
