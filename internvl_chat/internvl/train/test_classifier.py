@@ -105,13 +105,18 @@ def collate_fn(batch):
         negative_indices = []
         for i in range(batch_size):
             neg_indices = [j for j in range(batch_size) if not torch.all(labels[i] == labels[j])]
-            if not neg_indices:
+            if not neg_indices:  # If no negatives found, use all other indices except self
                 neg_indices = [j for j in range(batch_size) if j != i]
+            if not neg_indices:  # If still empty (batch size 1 or all same labels)
+                neg_indices = [i]  # Use self as negative if no other options
             negative_indices.append(neg_indices)
 
         max_neg_count = max(len(indices) for indices in negative_indices)
-        padded_negative_indices = [indices + [indices[-1]] * (max_neg_count - len(indices))
-                                   for indices in negative_indices]
+        # Safely pad with the first index if list is not empty, otherwise use the current index
+        padded_negative_indices = [
+            indices + [indices[0] if indices else i] * (max_neg_count - len(indices))
+            for i, indices in enumerate(negative_indices)
+        ]
         padded_negative_indices = torch.tensor(padded_negative_indices)
     else:
         positive_values = None
@@ -646,7 +651,8 @@ def filter_by_modality(data_items, test_modality, in_mod_pct, out_mod_pct, few_s
             # Stratified sampling for each label
             for label_tuple, items in label_dict.items():
                 num_to_keep = max(1, int(len(items) * keep_pct))
-                kept_items = random.sample(items, num_to_keep)
+                kept_items = items[:num_to_keep]  # Remove randomness for reproducibility
+                # kept_items = random.sample(items, num_to_keep)
                 filtered_items.extend(kept_items)
 
     return filtered_items
@@ -730,8 +736,9 @@ class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
                     dataset_size = 0
                     sampled_items = []
                     for label_tuple, items in label_data.items():
-                        samples = random.sample(items, min(self.shots_per_class, len(items)))
-                        sampled_items.extend(samples)
+                        # samples = random.sample(items, min(self.shots_per_class, len(items)))
+                        # Remove randomness for reproducibility
+                        sampled_items.extend(items[:(min(self.shots_per_class, len(items)))])
                         dataset_size += len(items)
 
                     # Oversample to match original dataset size
@@ -1026,14 +1033,16 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
         logger.info(f"Overall: {overall_stats}")
     except ValueError:
         logger.error(f'Error calculating overall statistics')
+        overall_stats = {}
 
     model.train()
+    return overall_stats
 
 
-def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5, freeze_vision=False,
+def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=1e-3, epochs=5, freeze_vision=False,
                      max_grad_norm=2.0, contrastive_weight=0.5,
-                     meta_train_path='../../../processing/meta_train.json',
-                     meta_valid_path='../../../processing/meta_valid.json',
+                     meta_train_path='../../../processing/meta_train_local.json',
+                     meta_valid_path='../../../processing/meta_valid_local.json',
                      eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0,
                      few_shot=False, shots_per_class=32, all_separate=False, eval_every=2000,
                      test_modality=None, in_mod_pct=1.0, out_mod_pct=1.0, moe=-1):
@@ -1187,6 +1196,14 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
                     new_key: str = key.replace('encoder.', 'vision_model.', 1)
                     new_checkpoint[new_key] = value
             checkpoint = new_checkpoint
+        elif 'model_state_dict' in checkpoint:  # This is pretrain model
+            checkpoint = checkpoint['model_state_dict']
+            for key, value in list(checkpoint.items()):
+                if 'fc' in key:
+                    checkpoint.pop(key)
+                elif 'encoder' in key:
+                    new_key: str = key.replace('encoder.', '', 1)
+                    checkpoint[new_key] = checkpoint.pop(key)
         incompatible_keys = model.load_state_dict(checkpoint, strict=False)
         logger.info(f'Loaded checkpoint from {load_checkpoint}')
         if incompatible_keys.missing_keys:
@@ -1320,7 +1337,7 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
             wandb.log(stats)
             if step % 100 == 0:
                 logger.info(f'Step {step}: {stats}')
-            if (step % eval_every == 0 and step > 0) or step == 100:
+            if step % eval_every == 0 and step > 0:
                 evaluate_classifier(model, train_val_dataset, device, 'train', step=step, epoch=epoch, bs=bs,
                                     num_samples=8000, dataloader=train_val_loader)
                 evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
@@ -1336,6 +1353,9 @@ def train_classifier(model_path, output_path, lr=1e-5, bs=16, wd=1e-3, epochs=5,
 
     # Save the model via huggingface
     torch.save(model.state_dict(), os.path.join(output_path, 'model.pt'))
+    overall_stats = evaluate_classifier(model, val_dataset, device, 'val', step=step, epoch=epoch, bs=bs,
+                                        num_samples=-1, dataloader=val_dataloader)
+    return overall_stats
 
 
 if __name__ == '__main__':
