@@ -651,8 +651,8 @@ def filter_by_modality(data_items, test_modality, in_mod_pct, out_mod_pct, few_s
             # Stratified sampling for each label
             for label_tuple, items in label_dict.items():
                 num_to_keep = max(1, int(len(items) * keep_pct))
-                kept_items = items[:num_to_keep]  # Remove randomness for reproducibility
-                # kept_items = random.sample(items, num_to_keep)
+                # kept_items = items[:num_to_keep]  # Remove randomness for reproducibility
+                kept_items = random.sample(items, num_to_keep)
                 filtered_items.extend(kept_items)
 
     return filtered_items
@@ -736,9 +736,10 @@ class FewShotContrastiveLazySupervisedDataset(ContrastiveLazySupervisedDataset):
                     dataset_size = 0
                     sampled_items = []
                     for label_tuple, items in label_data.items():
-                        # samples = random.sample(items, min(self.shots_per_class, len(items)))
+                        samples = random.sample(items, min(self.shots_per_class, len(items)))
                         # Remove randomness for reproducibility
-                        sampled_items.extend(items[:(min(self.shots_per_class, len(items)))])
+                        # sampled_items.extend(items[:(min(self.shots_per_class, len(items)))])
+                        sampled_items.extend(samples)
                         dataset_size += len(items)
 
                     # Oversample to match original dataset size
@@ -1039,7 +1040,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch, num_samp
     return overall_stats
 
 
-def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=1e-3, epochs=5, freeze_vision=False,
+def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=5, freeze_vision=False,
                      max_grad_norm=2.0, contrastive_weight=0.5,
                      meta_train_path='../../../processing/meta_train_local.json',
                      meta_valid_path='../../../processing/meta_valid_local.json',
@@ -1213,6 +1214,7 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=1e-3, epochs=
     model.train()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
+    model = torch.compile(model)
 
     if freeze_vision:
         logger.info('Freezing vision model')
@@ -1261,7 +1263,7 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=1e-3, epochs=
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
-        num_cycles=2
+        num_cycles=1
     )
 
     if eval_only:
