@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def run_modality_percentage_analysis(
+        model: str,
         base_output_path: str,
         test_modality: str = "derm",
         percentages: list = [0.0, 0.25, 0.5, 0.75, 1.0],
@@ -28,30 +29,31 @@ def run_modality_percentage_analysis(
 ):
     """
     Run analysis of how different combinations of in-modality and out-modality percentages
-    affect model performance.
+    affect model performance, reusing checkpoints from previous steps.
 
     Args:
+        model: Model path or identifier
         base_output_path: Base directory for saving experiment outputs
         test_modality: Modality to analyze (e.g., "derm")
-        percentages: List of percentage values to test
+        percentages: List of percentage values to test (must be sorted)
         shots_per_class: Number of shots per class for few-shot learning
         batch_size: Batch size for training
-        epochs: Number of epochs for training
         meta_valid_path: Path to validation metadata
     """
     # Create results directory
+    model_dir_str = model.split("/")[-1]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = os.path.join(base_output_path, f"{test_modality}_analysis_{timestamp}")
+    experiment_dir = os.path.join(base_output_path, f"{model_dir_str}_{test_modality}_analysis_{timestamp}")
     os.makedirs(experiment_dir, exist_ok=True)
 
     # Initialize results matrix
     results = np.zeros((len(percentages), len(percentages)))
 
-    # Initialize DataFrame to store all results
-    # results_df = pd.DataFrame(columns=['in_mod_pct', 'out_mod_pct', 'val_auc'])
-
     # For each out-modality percentage
     for i, out_mod_pct in enumerate(percentages):
+        # Dictionary to store checkpoints for this out_mod_pct row
+        last_checkpoint = None
+
         # For each in-modality percentage
         for j, in_mod_pct in enumerate(percentages):
             logger.info(f"\nRunning experiment with in_mod_pct={in_mod_pct}, out_mod_pct={out_mod_pct}")
@@ -60,33 +62,28 @@ def run_modality_percentage_analysis(
             exp_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             exp_name = f"in{in_mod_pct}_out{out_mod_pct}_{exp_time}"
             output_path = os.path.join(experiment_dir, exp_name)
+            os.makedirs(output_path, exist_ok=True)
 
             # Initialize new wandb run
             wandb.init(
-                project=f"{test_modality}_modality_analysis",
+                project=f"{model_dir_str}_{test_modality}_analysis",
                 name=exp_name,
                 config={
                     "in_mod_pct": in_mod_pct,
                     "out_mod_pct": out_mod_pct,
                     "test_modality": test_modality,
-                    "shots_per_class": shots_per_class
+                    "shots_per_class": shots_per_class,
+                    "checkpoint_from": last_checkpoint.split('/')[-2] if last_checkpoint else "None"
                 },
                 reinit=True
             )
 
-            # Dynamically set epochs based on in and out modality percentages
-            # Base number of steps should stay constant
-            base_epochs = 3
-            # in_mod_multiplier = 1.0 / max(in_mod_pct, 0.1)  # Prevent division by zero, minimum 10% data
-            # out_mod_multiplier = 1.0 / max(out_mod_pct, 0.1)  # Prevent division by zero, minimum 10% data
-            #
-            # # Calculate final epochs, ensuring we maintain similar number of training steps
-            # # We take the maximum multiplier because either reduction in data should lead to more epochs
-            # epochs = int(base_epochs * max(in_mod_multiplier, out_mod_multiplier))
+            # Base number of epochs
+            base_epochs = 2
 
-            # Run training
+            # Run training with checkpoint if available
             overall_stats = train_classifier(
-                model_path="facebook/convnextv2-base-22k-224",
+                model_path=model,
                 output_path=output_path,
                 bs=batch_size,
                 epochs=base_epochs,
@@ -96,40 +93,37 @@ def run_modality_percentage_analysis(
                 in_mod_pct=in_mod_pct,
                 out_mod_pct=out_mod_pct,
                 meta_valid_path=meta_valid_path,
-                eval_every=100000
+                eval_every=100000,
+                load_checkpoint=last_checkpoint
             )
 
             # Get the final validation AUC for the specific modality
-            # time.sleep(10)
-            # api = wandb.Api()
-            # runs = api.runs(f"{wandb.run.entity}/{wandb.run.project}")
-            # current_run = [r for r in runs if r.name == exp_name][0]
-            # history = current_run.history()
-            # val_auc = history[f'val/{test_modality}_auc'].dropna().iloc[-1]
             val_auc = overall_stats[f'val/{test_modality}_auc']
 
             # Store result
             results[i, j] = val_auc
-            # results_df = results_df.append({
-            #     'in_mod_pct': in_mod_pct,
-            #     'out_mod_pct': out_mod_pct,
-            #     'val_auc': val_auc
-            # }, ignore_index=True)
-            # no append now
 
-
-            # save current results matrix as csv
+            # Save current results matrix
             np.savetxt(os.path.join(experiment_dir, 'results.csv'), results, delimiter=',')
+
+            # Update checkpoint for next iteration
+            # Find the latest checkpoint in the current output directory
+            checkpoint_files = [f for f in os.listdir(output_path) if f.startswith('model_') and f.endswith('.pt')]
+            if checkpoint_files:
+                # Get the latest checkpoint based on step number
+                latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.split('_')[1].split('.')[0]))
+                last_checkpoint = os.path.join(output_path, latest_checkpoint)
+            else:
+                # If no intermediate checkpoints found, use the final model
+                last_checkpoint = os.path.join(output_path, 'model.pt')
 
             wandb.finish()
 
-            # Save intermediate results
+            # Save intermediate results visualization
             save_results(results, percentages, experiment_dir, test_modality)
-            # results_df.to_csv(os.path.join(experiment_dir, 'results.csv'), index=False)
 
     # Generate and save final visualization
     save_results(results, percentages, experiment_dir, test_modality)
-    # results_df.to_csv(os.path.join(experiment_dir, 'results.csv'), index=False)
 
     return results
 
@@ -185,11 +179,14 @@ if __name__ == "__main__":
     parser.add_argument('--meta_valid_path', type=str,
                         default="../../../processing/meta_pretrain_valid_local.json",
                         help='Path to validation metadata')
+    parser.add_argument('--model_path', type=str, default="facebook/convnextv2-base-22k-224",
+                        help='Model path for training')
 
     args = parser.parse_args()
 
     # Run analysis
     results = run_modality_percentage_analysis(
+        model=args.model_path,
         base_output_path=args.output_path,
         test_modality=args.test_modality,
         shots_per_class=args.shots_per_class,
