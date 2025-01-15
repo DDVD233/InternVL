@@ -25,7 +25,9 @@ def run_modality_percentage_analysis(
         percentages: list = [0.0, 0.25, 0.5, 0.75, 1.0],
         shots_per_class: int = 1,
         batch_size: int = 192,
-        meta_valid_path: str = "../../../processing/meta_pretrain_valid_local.json"
+        lr: float = 1.5e-4,
+        meta_valid_path: str = "../../../processing/meta_pretrain_valid_local.json",
+        meta_train_path: str = "../../../processing/meta_pretrain_train_local.json",
 ):
     """
     Run analysis of how different combinations of in-modality and out-modality percentages
@@ -43,11 +45,19 @@ def run_modality_percentage_analysis(
     # Create results directory
     model_dir_str = model.split("/")[-1]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = os.path.join(base_output_path, f"{model_dir_str}_{test_modality}_analysis_{timestamp}")
+    # experiment_dir = os.path.join(base_output_path, f"{model_dir_str}_{test_modality}_analysis_{timestamp}")
+    experiment_dir = base_output_path
     os.makedirs(experiment_dir, exist_ok=True)
 
     # Initialize results matrix
     results = np.zeros((len(percentages), len(percentages)))
+    results_file = os.path.join(base_output_path, 'results.csv')
+    
+    # Check if results already exist
+    if os.path.exists(results_file):
+        results = np.loadtxt(results_file, delimiter=',')
+        logger.info(f"Partial results loaded from {results_file}")
+    
 
     # For each out-modality percentage
     for i, out_mod_pct in enumerate(percentages):
@@ -56,11 +66,30 @@ def run_modality_percentage_analysis(
 
         # For each in-modality percentage
         for j, in_mod_pct in enumerate(percentages):
+            # Skip if results for this in_mod_pct already exist
+            if results[i, j] > 0.05:
+                logger.info(f"Skipping in_mod_pct={in_mod_pct}, out_mod_pct={out_mod_pct} as results already exist.")
+                if j > 0:  # Update last_checkpoint based on available data
+                    matching_dirs = [d for d in os.listdir(experiment_dir) if d.startswith(f"in{percentages[j-1]}_out{out_mod_pct}")]
+                    if matching_dirs:
+                        last_checkpoint_dir = os.path.join(experiment_dir, matching_dirs[0])
+                    else:
+                        logger.warning(f"No matching directory found for in_mod_pct={percentages[j-1]} and out_mod_pct={out_mod_pct}")
+                        continue
+                    
+                    checkpoint_files = [f for f in os.listdir(last_checkpoint_dir) if f.startswith('model_') and f.endswith('.pt')]
+                    if checkpoint_files:
+                        latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.split('_')[1].split('.')[0]))
+                        last_checkpoint = os.path.join(last_checkpoint_dir, latest_checkpoint)
+                continue
+
             logger.info(f"\nRunning experiment with in_mod_pct={in_mod_pct}, out_mod_pct={out_mod_pct}")
 
+
+
             # Create experiment output directory
-            exp_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_name = f"in{in_mod_pct}_out{out_mod_pct}_{exp_time}"
+            # exp_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_name = f"in{in_mod_pct}_out{out_mod_pct}"
             output_path = os.path.join(experiment_dir, exp_name)
             os.makedirs(output_path, exist_ok=True)
 
@@ -93,8 +122,10 @@ def run_modality_percentage_analysis(
                 in_mod_pct=in_mod_pct,
                 out_mod_pct=out_mod_pct,
                 meta_valid_path=meta_valid_path,
+                meta_train_path=meta_train_path,
                 eval_every=100000,
-                load_checkpoint=last_checkpoint
+                load_checkpoint=last_checkpoint,
+                lr=lr
             )
 
             # Get the final validation AUC for the specific modality
@@ -174,11 +205,16 @@ if __name__ == "__main__":
                         help='Number of shots per class')
     parser.add_argument('--batch_size', type=int, default=24,
                         help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=1.5e-4,
+                        help='Learning rate for training')
     # parser.add_argument('--epochs', type=int, default=3,
     #                     help='Number of epochs for training')
     parser.add_argument('--meta_valid_path', type=str,
                         default="../../../processing/meta_pretrain_valid_local.json",
                         help='Path to validation metadata')
+    parser.add_argument('--meta_train_path', type=str,
+                        default="../../../processing/meta_train_local.json",
+                        help='Path to training metadata')
     parser.add_argument('--model_path', type=str, default="facebook/convnextv2-base-22k-224",
                         help='Model path for training')
 
@@ -191,5 +227,7 @@ if __name__ == "__main__":
         test_modality=args.test_modality,
         shots_per_class=args.shots_per_class,
         batch_size=args.batch_size,
-        meta_valid_path=args.meta_valid_path
+        meta_valid_path=args.meta_valid_path,
+        meta_train_path=args.meta_train_path,
+        lr=args.lr
     )
