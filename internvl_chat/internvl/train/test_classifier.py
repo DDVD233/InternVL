@@ -1087,7 +1087,7 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=
     else:
         # dynamic_image_size = False
         image_size = 224
-        max_dynamic_patch = 2
+        max_dynamic_patch = 1
     logger.info(f'Image size: {image_size}, Max dynamic patch: {max_dynamic_patch}')
 
     if few_shot:
@@ -1229,12 +1229,12 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=
 
     # Load the dataset
     dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=collate_fn,
-                                             num_workers=64, pin_memory=True)
+                                             num_workers=32, pin_memory=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=bs, shuffle=False, collate_fn=collate_fn,
-                                                 num_workers=32, pin_memory=True)
+                                                 num_workers=12, pin_memory=True)
     train_val_loader = torch.utils.data.DataLoader(train_val_dataset, batch_size=bs, shuffle=True,
                                                    collate_fn=collate_fn,
-                                                   num_workers=32, pin_memory=True)
+                                                   num_workers=12, pin_memory=True)
 
     # Calculate total steps for the scheduler
     total_steps = len(dataloader) * epochs
