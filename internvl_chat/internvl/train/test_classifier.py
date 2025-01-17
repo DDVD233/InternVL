@@ -1045,7 +1045,7 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=
                      meta_train_path='../../../processing/meta_train_local.json',
                      meta_valid_path='../../../processing/meta_valid_local.json',
                      eval_only=False, load_checkpoint=None, no_contrastive=False, unfreeze_vit_layers=0,
-                     few_shot=False, shots_per_class=32, all_separate=False, eval_every=2000,
+                     few_shot=False, shots_per_class=32, all_separate=False, eval_every=1000,
                      test_modality=None, in_mod_pct=1.0, out_mod_pct=1.0, moe=-1):
     set_random_seed(42)
     if not os.path.exists(output_path):
@@ -1375,7 +1375,7 @@ if __name__ == '__main__':
     arg_parser.add_argument('--load_checkpoint', type=str, default=None)
     arg_parser.add_argument('--no_contrastive', action='store_true')
     arg_parser.add_argument('--unfreeze_vit_layers', type=int, default=0)
-    arg_parser.add_argument('--eval_every', type=int, default=2000)
+    arg_parser.add_argument('--eval_every', type=int, default=1000)
     arg_parser.add_argument('--few_shot', action='store_true',
                             help='Enable few-shot learning mode')
     arg_parser.add_argument('--shots_per_class', type=int, default=8,
