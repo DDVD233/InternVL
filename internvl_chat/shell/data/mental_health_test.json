@@ -1,0 +1,16 @@
+{
+  "mosei_test": {
+    "root": "/home/dvd/data/datasets/cmu_mosei/",
+    "annotation": "/home/dvd/data/datasets/cmu_mosei/annotation_test.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 62908
+  },
+  "mosei_valid": {
+    "root": "/home/dvd/data/datasets/cmu_mosei/",
+    "annotation": "/home/dvd/data/datasets/cmu_mosei/annotation_valid.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 62908
+  }
+}

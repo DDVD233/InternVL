@@ -4,11 +4,16 @@
 # Licensed under The MIT License [see LICENSE for details]
 # Modified from https://github.com/hreikin/streamlit-uploads-library/blob/main/streamlit_uploads_library/library.py
 # --------------------------------------------------------
-
+import datetime
+import hashlib
 import logging
+import os
+from io import BytesIO
 from math import ceil
+from constants import LOGDIR
 
 import streamlit as st
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +66,17 @@ class Library():
 
                 for item in media[media_idx:(media_idx + number_of_columns)]:
                     with media_columns[col_idx]:
+                        if isinstance(item, BytesIO):  # this is a UploadedFile
+                            if item.type.startswith('image/'):
+                                item = Image.open(item)
+                            elif item.type.startswith('video/'):
+                                # save it to a temporary file
+                                t = datetime.datetime.now()
+                                filename = os.path.join(LOGDIR, 'serve_files', f'{t.year}-{t.month:02d}-{t.day:02d}',
+                                                        hashlib.md5(item.getvalue()).hexdigest() + '.mp4')
+                                with open(filename, 'wb') as f:
+                                    f.write(item.getvalue())
+                                item = filename
                         if is_from_pil(item):
                             st.image(item, use_column_width='auto')
                         elif isinstance(item, tuple):

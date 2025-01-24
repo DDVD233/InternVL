@@ -39,9 +39,13 @@ sd_worker_url = args.sd_worker_url
 max_image_limit = args.max_image_limit
 print('args:', args)
 
-hidden_prompt = ('You are an Video Chat Bot built by Multisensory Intelligence Group at MIT Media Lab, '
-                 'based on the InternVL2 structure by OpenGVLab. When asked about your name, you should say "Multisensory Chatbot".'
-                 ' Treat multiple images as scenes in a video. Say "in the first scene" instead of "in the first image".')
+hidden_prompt = ('You are a Chat Bot built by Multisensory Intelligence Group at MIT Media Lab, based on the InternVL2 structure by OpenGVLab. '
+                 'You are finetuned on social intelligence dataset, so you are an expert in understanding social interactions.  '
+                 'When asked about your name, you should say "Multisensory Chatbot".'
+                 ' Treat multiple images a coherent video. Do not say "in the first image" or "in Image-1." Instead, analyze the whole video. '
+                 'When you respond to a question, you should provide an extra detailed answer that is as accurate as possible. '
+                 'If you are presented with a video but got no questions, you should first analyze the video scene, '
+                 'then give advice in terms of mental health and social interactions to the people in the video. ')
 
 
 def get_conv_log_filename():
@@ -127,6 +131,17 @@ def generate_response(messages):
             if 'media' in message and len(message['media']) > 0:
                 user_message['image'] = []
                 for item in message['media']:
+                    if isinstance(item, BytesIO):  # this is a UploadedFile
+                        if item.type.startswith('image/'):
+                            item = Image.open(item)
+                        elif item.type.startswith('video/'):
+                            # save it to a temporary file
+                            t = datetime.datetime.now()
+                            filename = os.path.join(LOGDIR, 'serve_files', f'{t.year}-{t.month:02d}-{t.day:02d}',
+                                                   hashlib.md5(item.getvalue()).hexdigest() + '.mp4')
+                            with open(filename, 'wb') as f:
+                                f.write(item.getvalue())
+                            item = filename
                     item_ = item[1] if isinstance(item, tuple) else item
                     if is_from_pil(item_):
                         user_message['image'].append(pil_image_to_base64(item))
@@ -157,11 +172,11 @@ def generate_response(messages):
         'repetition_penalty': float(repetition_penalty),
     }
     worker_addr = get_selected_worker_ip()
-    headers = {'User-Agent': 'InternVL-Chat Client'}
+    headers = {'User-Agent': 'Chat Client'}
     placeholder, output = st.empty(), ''
     try:
         response = requests.post(worker_addr + '/worker_generate_stream',
-                                 headers=headers, json=pload, stream=True, timeout=10)
+                                 headers=headers, json=pload, stream=True, timeout=999)
         for chunk in response.iter_lines(decode_unicode=True, delimiter=b'\0'):
             if chunk:
                 data = json.loads(chunk.decode())
@@ -284,13 +299,13 @@ logo_code = """
     </linearGradient>
   </defs>
   <text x="000" y="160" font-size="180" font-weight="bold" fill="url(#gradient1)" style="font-family: Arial, sans-serif;">
-    Video Chat Demo
+    Social Intelligence Chatbot
   </text>
 </svg>
 """
 
 # App title
-st.set_page_config(page_title='Multisensory Intelligence')
+st.set_page_config(page_title='Social Intelligence Chatbot')
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
@@ -304,60 +319,29 @@ with st.sidebar:
     # "[![Open in GitHub](https://github.com/codespaces/badge.svg)](https://github.com/OpenGVLab/InternVL)"
     lan = st.selectbox('#### Language', ['English'], on_change=st.rerun,
                        help='This is only for switching the UI language. 这仅用于切换UI界面的语言。')
-    if lan == 'English':
-        # st.logo(logo_code, link='https://github.com/OpenGVLab/InternVL', icon_image=logo_code)
-        st.subheader('Models and parameters')
-        selected_model = st.sidebar.selectbox('Choose a chat model', model_list, key='selected_model',
-                                              on_change=clear_chat_history,
-                                              help='Due to the limited GPU resources with public IP addresses, we can currently only deploy models up to a maximum of 26B.')
-        with st.expander('🤖 System Prompt'):
-            persona_rec = st.text_area('System Prompt', value=system_message_editable,
-                                       help='System prompt is a pre-defined message used to instruct the assistant at the beginning of a conversation.',
-                                       height=200)
-        with st.expander('🔥 Advanced Options'):
-            temperature = st.slider('temperature', min_value=0.0, max_value=1.0, value=0.7, step=0.1)
-            top_p = st.slider('top_p', min_value=0.0, max_value=1.0, value=0.95, step=0.05)
-            repetition_penalty = st.slider('repetition_penalty', min_value=1.0, max_value=1.5, value=1.1, step=0.02)
-            max_length = st.slider('max_new_token', min_value=0, max_value=4096, value=1024, step=128)
-            max_input_tiles = st.slider('max_input_tiles (control image resolution)', min_value=1, max_value=24,
-                                        value=12, step=1)
-        upload_image_preview = st.empty()
-        uploaded_files = st.file_uploader('Upload files', accept_multiple_files=True,
-                                          type=['png', 'jpg', 'jpeg', 'webp', 'mp4', 'avi', 'mov'],
-                                          help='You can upload multiple images (max to 4) or a single video.',
-                                          key=f'uploader_{st.session_state.uploader_key}',
-                                          on_change=st.rerun)
-        uploaded_pil_images, save_filenames = load_upload_file_and_show()
-        # todo_list = st.sidebar.selectbox('Our to-do list', ['👏This is our to-do list',
-        #                                                     '1. Support for video uploads',
-        #                                                     '2. Support for PDF uploads',
-        #                                                     '3. Write a usage document'], key='todo_list',
-        #                                  help='Here are some features we plan to support in the future.')
-    else:
-        st.subheader('模型和参数')
-        selected_model = st.sidebar.selectbox('选择一个对话模型', model_list, key='selected_model',
-                                              on_change=clear_chat_history,
-                                              help='由于有限的公网GPU资源，我们暂时只能部署到最大参数26B的模型。')
-        with st.expander('🤖 系统提示'):
-            persona_rec = st.text_area('系统提示', value=system_message_editable,
-                                       help='系统提示是在对话开始时用于指示助手的预定义消息。',
-                                       height=200)
-        with st.expander('🔥 高级选项'):
-            temperature = st.slider('temperature', min_value=0.0, max_value=1.0, value=0.7, step=0.1)
-            top_p = st.slider('top_p', min_value=0.0, max_value=1.0, value=0.95, step=0.05)
-            repetition_penalty = st.slider('重复惩罚', min_value=1.0, max_value=1.5, value=1.1, step=0.02)
-            max_length = st.slider('最大输出长度', min_value=0, max_value=4096, value=1024, step=128)
-            max_input_tiles = st.slider('最大图像块数 (控制图像分辨率)', min_value=1, max_value=24, value=12, step=1)
-        upload_image_preview = st.empty()
-        uploaded_files = st.file_uploader('上传文件', accept_multiple_files=True,
-                                          type=['png', 'jpg', 'jpeg', 'webp', 'mp4', 'avi', 'mov'],
-                                          help='你可以上传多张图像（最多4张）或者一个视频。',
-                                          key=f'uploader_{st.session_state.uploader_key}',
-                                          on_change=st.rerun)
-        uploaded_pil_images, save_filenames = load_upload_file_and_show()
-        todo_list = st.sidebar.selectbox('我们的待办事项', ['👏这里是我们的待办事项', '1. 支持上传视频',
-                                                     '2. 支持上传 PDF 文档', '3. 写一个使用文档'], key='todo_list',
-                                         help='这是我们计划要支持的一些功能。')
+    # st.logo(logo_code, link='https://github.com/OpenGVLab/InternVL', icon_image=logo_code)
+    st.subheader('Models and parameters')
+    selected_model = st.sidebar.selectbox('Choose a chat model', model_list, key='selected_model',
+                                          on_change=clear_chat_history,
+                                          help='Due to the limited GPU resources with public IP addresses, we can currently only deploy models up to a maximum of 26B.')
+    with st.expander('🤖 System Prompt'):
+        persona_rec = st.text_area('System Prompt', value=system_message_editable,
+                                   help='System prompt is a pre-defined message used to instruct the assistant at the beginning of a conversation.',
+                                   height=200)
+    with st.expander('🔥 Advanced Options'):
+        temperature = st.slider('temperature', min_value=0.0, max_value=1.0, value=0.7, step=0.1)
+        top_p = st.slider('top_p', min_value=0.0, max_value=1.0, value=0.95, step=0.05)
+        repetition_penalty = st.slider('repetition_penalty', min_value=1.0, max_value=1.5, value=1.1, step=0.02)
+        max_length = st.slider('max_new_token', min_value=0, max_value=4096, value=1024, step=128)
+        max_input_tiles = st.slider('max_input_tiles (control image resolution)', min_value=1, max_value=24,
+                                    value=12, step=1)
+    upload_image_preview = st.empty()
+    uploaded_files = st.file_uploader('Upload files', accept_multiple_files=True,
+                                      type=['png', 'jpg', 'jpeg', 'webp', 'mp4', 'avi', 'mov'],
+                                      help='You can upload multiple images (max to 4) or a single video.',
+                                      key=f'uploader_{st.session_state.uploader_key}',
+                                      on_change=st.rerun)
+    uploaded_pil_images, save_filenames = load_upload_file_and_show()
 
 gradient_text_html = """
 <style>
@@ -371,14 +355,10 @@ gradient_text_html = """
     font-size: 3em;
 }
 </style>
-<div class="gradient-text">Video Chat Demo</div>
+<div class="gradient-text">Social Intelligence Chatbot</div>
 """
-if lan == 'English':
-    st.markdown(gradient_text_html, unsafe_allow_html=True)
-    st.caption('Expanding Performance Boundaries of Open-Source Multimodal Large Language Models')
-else:
-    st.markdown(gradient_text_html.replace('InternVL2', '书生·万象'), unsafe_allow_html=True)
-    st.caption('扩展开源多模态大语言模型的性能边界')
+st.markdown(gradient_text_html, unsafe_allow_html=True)
+st.caption('Expanding Performance Boundaries of Open-Source Multimodal Large Language Models')
 
 # Store LLM generated responses
 if 'messages' not in st.session_state.keys():
@@ -386,8 +366,7 @@ if 'messages' not in st.session_state.keys():
 
 gallery_placeholder = st.empty()
 with gallery_placeholder.container():
-    examples = ['gallery/prod_9.jpg',
-                'gallery/prod_12.png', 'gallery/prod_en_17.png',
+    examples = ['gallery/1_12002_c.mp4', 'gallery/1_4850_c.mp4', 'gallery/mime_1.mp4',
                 'gallery/emotion_1.jpg', 'gallery/cheetah.png', 'gallery/mi_logo.jpg',
                 'gallery/1_427.mp4']
 
@@ -400,22 +379,13 @@ with gallery_placeholder.container():
             images.append(img)
         else:
             images.append(filename)
-    if lan == 'English':
-        captions = ["What's at the far end of the image?",
-                    'What are the consequences of the easy decisions shown in this image?',
-                    "I'm on a diet, but I really want to eat them.",
-                    'What is the emotion of each person in the scene?',
-                    'Detect the <ref>the middle leopard</ref> in the image with its bounding box.',
-                    'What do you think of this logo?',
-                    'What is the emotion of each person in the scene in each frame?']
-    else:
-        captions = ['画面最远处是什么?',
-                    '请画一张类似这样的画',
-                    '这张图上 easy decisions 导致了什么后果?',
-                    '我在减肥，但我真的很想吃这个。',
-                    '这是真的植物吗？分析原因',
-                    '在以下图像中进行目标检测，并标出所有物体。',
-                    '这幅图的氛围如何？']
+    captions = ["What is funny about this scene?",
+                'Spot the sarcasm in this scene.',
+                'What is the person doing in this scene? Why does the person seem surprised?',
+                'What is the emotion of each person in the scene?',
+                'Detect the <ref>the middle leopard</ref> in the image with its bounding box.',
+                'What do you think of this logo?',
+                'What is funny about this scene?']
     img_idx = image_select(
         label='',
         images=images,
@@ -456,7 +426,7 @@ if lan == 'English':
         prompt = st.chat_input('Too many images have been uploaded. Please clear the history.',
                                disabled=input_disable_flag)
     else:
-        prompt = st.chat_input('Send messages to InternVL', disabled=input_disable_flag)
+        prompt = st.chat_input('Send messages...', disabled=input_disable_flag)
 else:
     st.sidebar.button('清空聊天记录', on_click=partial(combined_func, func_list=[clear_chat_history, clear_file_uploader]))
     if input_disable_flag:

@@ -29,7 +29,9 @@ from fastapi.responses import StreamingResponse
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, TextIteratorStreamer
-from utils import build_logger, pretty_print_semaphore, server_error_msg
+from streamlit_utils import build_logger, pretty_print_semaphore, server_error_msg
+
+from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 
 import whisper
 from moviepy.editor import VideoFileClip
@@ -178,14 +180,14 @@ class ModelWorker:
 
         if device == 'auto':
             device_map = split_model(self.model_name)
-            self.model = AutoModel.from_pretrained(
+            self.model = InternVLChatModel.from_pretrained(
                 model_path,
                 load_in_8bit=load_8bit,
                 torch_dtype=torch.bfloat16,
                 device_map=device_map,
                 trust_remote_code=True).eval()
         else:
-            self.model = AutoModel.from_pretrained(
+            self.model = InternVLChatModel.from_pretrained(
                 model_path,
                 load_in_8bit=load_8bit,
                 torch_dtype=torch.bfloat16,

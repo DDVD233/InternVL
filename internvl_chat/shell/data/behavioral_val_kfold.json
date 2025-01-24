@@ -1,0 +1,72 @@
+{
+  "behavioral_phq_split1": {
+    "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+    "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split1_val_annotations_phq.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 608
+  },
+    "behavioral_phq_split2": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split2_val_annotations_phq.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+    "behavioral_phq_split3": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split3_val_annotations_phq.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+    "behavioral_phq_split4": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split4_val_annotations_phq.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+    "behavioral_phq_split5": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split5_val_annotations_phq.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+  "behavioral_phq_binary_split1": {
+    "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+    "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split1_val_annotations_phq_binary.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 608
+  },
+    "behavioral_phq_binary_split2": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split2_val_annotations_phq_binary.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+    "behavioral_phq_binary_split3": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split3_val_annotations_phq_binary.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+    "behavioral_phq_binary_split4": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split4_val_annotations_phq_binary.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    },
+    "behavioral_phq_binary_split5": {
+        "root": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/",
+        "annotation": "/media/dvd/Data/Box/Behavioral Health/Full Code Backup/data/processed_internvl/processed_all_concat/split5_val_annotations_phq_binary.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 609
+    }
+}

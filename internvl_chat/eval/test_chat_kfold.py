@@ -5,24 +5,29 @@ from internvl_chat.eval.test_chat_generic import test_model
 
 VAL_META_PATH = 'shell/data/behavioral_val_kfold.json'
 
-
 def test_chat_kfold():
-    path_extensions = ['split1', 'split2', 'split3', 'split4', 'split5']
-    # path_extensions = ['split1']
+    # path_extensions = ['split1', 'split2', 'split3', 'split4', 'split5']
+    path_extensions = ['split1']
     # path_base = '/home/dvd/data/outputs/phq9_binary_on_vanilla_26B_lora'
-    path_base = '/home/dvd/data/outputs/phq9_26B_opensmile'
+    path_base = '/home/dvd/data/outputs/phq9_8B_lora_nodrop'
     paths = [f'{path_base}_{ext}' for ext in path_extensions]
     # paths = ['/home/dvd/data/outputs/all_public_backbones_26B_opensmile/checkpoint-2000'] * 5
-    # paths = ['OpenGVLab/InternVL2-26B'] * 5
+    # paths = ['/home/dvd/data/outputs/phq9_8B_lora_nodrop_split1/checkpoint-140']
     print(f'Paths: {paths}')
     dataset_base = 'behavioral_phq'
     datasets = [f'{dataset_base}_{ext}' for ext in path_extensions]
     metrics_list = []
     counts = []
     for path, dataset in zip(paths, datasets):
-        metrics, count = test_model(meta_path=VAL_META_PATH,
-                                    dataset_name=dataset,
-                                    path=path)
+        train_path = path.replace(path_base, 'shell/data/behavioral_phq') + '.json'
+        # metrics, count = test_model(meta_path=VAL_META_PATH,
+        #                             dataset_name=dataset,
+        #                             path=path,
+        #                             modality='audio')
+        metrics, count = test_model(meta_path=train_path,
+                                    dataset_name=dataset_base,
+                                    path=path,
+                                    modality='all')
         metrics_list.append(metrics)
         counts.append(count)
 
@@ -37,10 +42,10 @@ def test_chat_kfold():
             total_counts[key] += value
 
     print('Individual metrics:', metrics_list)
-    print('Individual counts:', counts)
+    # print('Individual counts:', counts)
 
     print('Aggregated metrics:', metrics_aggregated)
-    print('Aggregated counts:', total_counts)
+    # print('Aggregated counts:', total_counts)
     return metrics_aggregated
 
 

@@ -1,4 +1,4 @@
-import json
+import ujson as json
 import os
 from collections import defaultdict
 from typing import List
@@ -15,6 +15,8 @@ from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
                                       REF_START_TOKEN)
 from internvl.model.internvl_chat import InternVLChatModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
+# prog bar
+from tqdm import tqdm
 
 import argparse
 
@@ -24,31 +26,41 @@ AUDIO_END_TOKEN = '</audio>'
 AUDIO_CONTEXT_TOKEN = '<AUDIO_CONTEXT>'
 
 
-def test_model(meta_path, dataset_name, path):
+def test_model(meta_path, dataset_name, path, modality='all'):
     print(f'Path: {path}')
 
     # load in bfloat16
-    device_map = {
-        'audio': 1,
-        'vision_model': 1,
-        'mlp1': 1,
-        'mlp2': 1,
-        'language_model': 0,
-    }
-    model: InternVLChatModel = InternVLChatModel.from_pretrained(
-        path,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.bfloat16,
-        device_map=device_map
-    )
-    model: InternVLChatModel = model.eval()
-    # model = model.to('cuda')
+
+    if '26B' in path:
+        device_map = {
+            'audio': 1,
+            'vision_model': 1,
+            'mlp1': 1,
+            'mlp2': 1,
+            'language_model': 0,
+        }
+        model: InternVLChatModel = InternVLChatModel.from_pretrained(
+            path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map
+        )
+        model: InternVLChatModel = model.eval()
+    else:
+        model: InternVLChatModel = InternVLChatModel.from_pretrained(
+            path,
+            torch_dtype=torch.bfloat16
+        ).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     if 'OpenGVLab' in path:  # vanilla model
         tokenizer.add_tokens([AUDIO_START_TOKEN, AUDIO_END_TOKEN, AUDIO_CONTEXT_TOKEN], special_tokens=True)
         model.language_model.resize_token_embeddings(len(tokenizer))
         model.audio.load_state_dict(torch.load('audio.pth'), strict=False)
+        model.init_mlp2()
+
+    if '26B' not in path:
+        model = model.to('cuda')
 
     with open(meta_path, 'r') as f:
         ds_collections = json.load(f)
@@ -72,7 +84,7 @@ def test_model(meta_path, dataset_name, path):
             max_dynamic_patch=4,
             repeat_time=1,
             normalize_type="imagenet",
-
+            audio_encoder_type="whisper",
         )
     generation_config = dict(
         num_beams=1,
@@ -90,14 +102,20 @@ def test_model(meta_path, dataset_name, path):
     model.audio_context_token_id = audio_context_token_id
 
     # get categories
-    if 'What is the emotion of the speaker in this video?\n' in dataset[0]['question']:
-        sample = (dataset[0]['question'].split('What is the emotion of the speaker in this video?\n')[1]
-                  .split('\nAnswer with one word or phrase.')[0])
-        categories = sample.split('\n')
-    elif 'yes\nno\n' in dataset[0]['question']:
-        categories = ['yes', 'no']
-    else:
-        raise ValueError('Unexpected question format')
+    # if 'What is the emotion of the speaker in this video?\n' in dataset[0]['question']:
+    #     sample = (dataset[0]['question'].split('What is the emotion of the speaker in this video?\n')[1]
+    #               .split('\nAnswer with one word or phrase.')[0])
+    #     categories = sample.split('\n')
+    # elif 'yes\nno\n' in dataset[0]['question']:
+    #     categories = ['yes', 'no']
+    # else:
+    #     # Go through answers and get categories
+    categories = []
+    for index, sample in enumerate(dataset.raw_data):
+        answer = json.loads(sample)['conversations'][1]['value']
+        if answer not in categories:
+            categories.append(answer)
+    print(f'Categories: {categories}')
     counts = defaultdict(int)
     categories.append('unknown')
     metrics = {
@@ -113,9 +131,31 @@ def test_model(meta_path, dataset_name, path):
         os.makedirs(output_path)
 
     for index, sample in enumerate(dataloader):
-        if '<image>\n<audio>' not in sample['question'][0]:
+        included_modality = []
+        if 'mosei' in dataset_name and modality != 'all':
+            if modality == 'image':
+                sample['question'][0] = sample['question'][0].replace('<audio>\n', '')
+                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + sample['question'][0].split('\'')[-1]
+                sample['audio_flags'] = torch.zeros_like(sample['audio_flags'])
+            if modality == 'audio':
+                sample['question'][0] = sample['question'][0].replace('<image>\n', '')
+                sample['question'][0] = sample['question'][0].split('The speaker said: \'')[0] + sample['question'][0].split('\'')[-1]
+                sample['image_flags'] = torch.zeros_like(sample['image_flags'])
+            if modality == 'text':
+                sample['question'][0] = sample['question'][0].replace('<audio>\n', '').replace('<image>\n', '')
+        if sample['image_flags'][0].item() == 1:
+            included_modality.append('image')
+        if sample['audio_flags'].size(0) > 1 and sample['audio_flags'][0].item() == 1:
+            included_modality.append('audio')
+        if 'The speaker said' in sample['question'][0]:
+            included_modality.append('text')
+        if modality == 'all' and len(included_modality) != 3:
             continue
-        if 'The speaker said' not in sample['question'][0]:
+        if modality == 'image' and ('image' not in included_modality or len(included_modality) > 1):
+            continue
+        if modality == 'audio' and ('audio' not in included_modality or len(included_modality) > 1):
+            continue
+        if modality == 'text' and ('text' not in included_modality or len(included_modality) > 1):
             continue
         # move to cuda
         for key in sample.keys():
@@ -186,7 +226,7 @@ if __name__ == '__main__':
 
     # path = "OpenGVLab/Mini-InternVL-Chat-4B-V1-5"  # Vanilla model
     # path = "OpenGVLab/InternVL2-4B"  # Vanilla model
-    # path = "OpenGVLab/InternVL2-8B"  # Vanilla model
+    # path = "OpenGVLab/InternVL2-26B"  # Vanilla model
     # path = "/home/data/outputs/all_public_backbone_2"  # Backbone trained on public
     # path = "/home/data/outputs/phq9_lora"  # Pretrained on PHQ9 with lora
     # path = "/home/dvd/data/outputs/phq9_pretrain_nonlora/"  # Pretrained on PHQ9 without lora *
@@ -198,8 +238,9 @@ if __name__ == '__main__':
     # path = '/home/dvd/data/outputs/phq9_binary_pretrain'
     # path = '/home/dvd/data/outputs/phq9_binary_lora'
     # path = '/home/dvd/data/outputs/phq9_binary_pretrain_on_vanilla_8B'
-    path = '/home/dvd/data/outputs/phq9_on_vanilla_26B_lora_split3/'
+    path = '/home/dvd/data/outputs/all_public_backbones_8B_opensmile_nodrop'
     print(f'Path: {path}')
-    test_model(meta_path='shell/data/behavioral_val_kfold.json',
-               dataset_name='behavioral_phq_split3',
-               path=path)
+    test_model(meta_path='shell/data/mental_health_test.json',
+               dataset_name='mosei_test',
+               path=path,
+               modality='audio')

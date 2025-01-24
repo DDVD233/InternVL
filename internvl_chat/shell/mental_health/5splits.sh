@@ -2,7 +2,7 @@
 
 for i in {1..5}; do
     CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PYTHONPATH:./ LAUNCHER=pytorch python internvl/train/internvl_chat_audio_finetune.py \
-    --model_name_or_path "/home/dvd/data/outputs/all_public_backbones_8B" \
+    --model_name_or_path "/home/dvd/data/outputs/all_public_backbones_8B_opensmile_nodrop" \
     --conv_style "internlm2-chat" \
     --output_dir "/home/dvd/data/outputs/phq9_8B_split$i" \
     --meta_path "shell/data/behavioral_phq_split$i.json" \
@@ -19,7 +19,7 @@ for i in {1..5}; do
     --use_data_resampling False \
     --dataloader_num_workers 1 \
     --bf16 True \
-    --num_train_epochs 12 \
+    --num_train_epochs 6 \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 8 \
     --evaluation_strategy "no" \
