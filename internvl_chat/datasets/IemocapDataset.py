@@ -180,7 +180,7 @@ class IemocapDataset(object):
 
         return sample
 
-    def collage_fn_vgg(batch):
+    def collage_fn_vgg(self, batch):
         # Clip or pad each utterance audio into 4.020 seconds.
         sample_rate = 16000
         n_channels = 1
@@ -199,7 +199,7 @@ class IemocapDataset(object):
 
         return waveforms, emotions
 
-    def collate_fn_segments(batch):
+    def collate_fn_segments(self, batch):
         # Segment each sample into 264ms frames and 25ms sliding window
         sample_rate = 16000
         segment_length = np.int(0.264 * sample_rate)
@@ -243,7 +243,7 @@ class IemocapDataset(object):
 
         return segments, emotions, n_segments, filenames
 
-    def collate_fn(batch):
+    def collate_fn(self, batch):
         # Frame each sample into 25ms frames and 10ms sliding (step) window.
         # This means that the frame length for a 16kHz signal is 0.025 * 16000 = 400 samples.
         # Frame step is usually something like 10ms (160 samples), which allows some overlap to the frames.
