@@ -37,6 +37,48 @@ def set_random_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def sample_frames(video_path: str, num_frames: int, is_train: bool) -> List[Image.Image]:
+    """
+    Sample frames from a video file, excluding first and last frames for uniform sampling.
+
+    Args:
+        video_path: Path to the video file
+        num_frames: Number of frames to sample
+        is_train: If True, use random sampling; if False, use uniform sampling excluding first/last frames
+
+    Returns:
+        List of PIL Images
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total_frames == 0:
+        raise ValueError(f"No frames found in video: {video_path}")
+
+    if is_train:
+        # Random sampling for training
+        frame_indices = sorted(random.sample(range(total_frames), min(num_frames, total_frames)))
+    else:
+        # Sample num_frames + 2 points uniformly, then remove first and last
+        frame_indices = np.linspace(0, total_frames - 1, num_frames + 2, dtype=int)[1:-1]
+
+    frames = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Convert to PIL Image
+            frame = Image.fromarray(frame)
+            frames.append(frame)
+        else:
+            raise ValueError(f"Failed to read frame {idx} from video: {video_path}")
+
+    cap.release()
+    return frames
+
+
 def collate_fn(batch):
     # Find max length of pixel_values in the batch
     max_length = max(item['pixel_values'].size(0) for item in batch)
@@ -231,11 +273,20 @@ class SingleDatasetLazySupervisedDataset(Dataset):
         transform = self.get_transform()
 
         images = []
-        if 'images' in data_item:
-            for image_path in data_item['images']:
-                image = self.load_image(image_path)
-                images.append(image)
-
+        try:
+            if 'images' in data_item and len(data_item['images']) > 0:
+                for image_path in data_item['images']:
+                    image = self.load_image(image_path)
+                    images.append(image)
+            elif 'videos' in data_item and len(data_item['videos']) > 0:
+                for video_path in data_item['videos']:
+                    video = sample_frames(video_path, 1, self.is_train)
+                    images.extend(video)
+            else:
+                images = [torch.zeros((3, self.image_size, self.image_size))]
+        except Exception as e:
+            logger.error(f"Error processing item {i}: {e}")
+            images = [torch.zeros((3, self.image_size, self.image_size))]
         pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
 
@@ -295,23 +346,29 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch):
     is_multilabel = len(dataset.dataset_multilabel) > 0
 
     if is_multilabel:
-        predictions = (torch.sigmoid(outputs) > 0.5).float()
-        accuracy = 1 - hamming_loss(labels.numpy(), predictions.numpy())
+        # Convert to numpy first to ensure shape consistency
+        labels_np = labels.numpy()
+        outputs_np = outputs.numpy()
+
+        # Apply sigmoid and get predictions
+        predictions_np = (1 / (1 + np.exp(-outputs_np))) > 0.5
+
+        accuracy = 1 - hamming_loss(labels_np, predictions_np)
 
         # Handle case where all predictions are 0
-        zero_pred_samples = (predictions.sum(dim=1) == 0)
+        zero_pred_samples = (predictions_np.sum(axis=1) == 0)
         if any(zero_pred_samples):
-            highest_prob_indices = outputs[zero_pred_samples].argmax(dim=1)
-            sample_indices = torch.where(zero_pred_samples)[0]
-            predictions[sample_indices, highest_prob_indices] = 1
+            highest_prob_indices = outputs_np[zero_pred_samples].argmax(axis=1)
+            sample_indices = np.where(zero_pred_samples)[0]
+            predictions_np[sample_indices, highest_prob_indices] = True
 
         try:
-            auc = roc_auc_score(labels.numpy(), torch.sigmoid(outputs).numpy(), average='macro')
+            auc = roc_auc_score(labels_np, 1 / (1 + np.exp(-outputs_np)), average='macro')
         except ValueError:
             auc = None
 
-        sensitivity, specificity = calculate_multilabel_metrics(labels.numpy(), predictions.numpy())
-        f1 = f1_score(labels.numpy(), predictions.numpy(), average='macro')
+        sensitivity, specificity = calculate_multilabel_metrics(labels_np, predictions_np)
+        f1 = f1_score(labels_np, predictions_np, average='macro')
 
     else:
         outputs = torch.softmax(outputs, dim=1)
@@ -321,16 +378,18 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch):
 
         try:
             auc = roc_auc_score(
-                torch.nn.functional.one_hot(labels).numpy(),
+                torch.nn.functional.one_hot(labels, num_classes=outputs.size(1)).numpy(),
                 outputs.numpy(),
                 average='macro'
             )
         except ValueError:
             auc = None
 
-        tn, fp, fn, tp = confusion_matrix(labels, predictions).ravel()
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        # Convert to one-hot for binary metrics
+        y_true_binary = torch.nn.functional.one_hot(labels, num_classes=outputs.size(1)).numpy()
+        y_pred_binary = torch.nn.functional.one_hot(predictions, num_classes=outputs.size(1)).numpy()
+
+        sensitivity, specificity = calculate_multilabel_metrics(y_true_binary, y_pred_binary)
         f1 = f1_score(labels, predictions, average='macro')
 
     stats = {
@@ -576,16 +635,36 @@ def main():
     # Create main output directory
     os.makedirs(args.output_path, exist_ok=True)
 
+    # Load existing results if they exist
+    results_path = os.path.join(args.output_path, 'all_results.json')
+    if os.path.exists(results_path):
+        logger.info("Loading existing results from all_results.json")
+        try:
+            with open(results_path, 'r') as f:
+                existing_results = json.load(f)
+            all_results = existing_results.get('dataset_results', {})
+            logger.info(f"Found results for {len(all_results)} datasets")
+        except json.JSONDecodeError:
+            logger.warning("Error loading existing results, starting fresh")
+            all_results = {}
+    else:
+        all_results = {}
+
     # Get list of datasets from meta files
     with open(args.meta_train_path, 'r') as f:
         meta_train = json.load(f)
     dataset_names = list(meta_train.keys())
 
     # Train on each dataset separately
-    all_results = {}
     for dataset_name in dataset_names:
+        # Skip if already processed
+        if dataset_name in all_results:
+            logger.info(f'Skipping dataset {dataset_name} - already processed')
+            continue
+
         logger.info(f'\n{"=" * 50}\nTraining on dataset: {dataset_name}\n{"=" * 50}')
 
+        modality_averages = {}
         try:
             results = train_single_dataset(
                 model_path=args.model_path,
@@ -601,40 +680,50 @@ def main():
             )
             all_results[dataset_name] = results
 
+            # Calculate and save intermediate results after each dataset
+            modality_results = defaultdict(list)
+            modality_metrics = defaultdict(lambda: defaultdict(list))
+
+            for ds_name, res in all_results.items():
+                modality = ds_name.split('_')[0]  # Get modality from dataset name
+                modality_results[modality].append((ds_name, res))
+
+                # Collect metrics for each modality
+                for metric, value in res.items():
+                    if isinstance(value, float):
+                        modality_metrics[modality][metric].append(value)
+
+            # Calculate averages for each modality
+            for modality, metrics in modality_metrics.items():
+                modality_averages[modality] = {
+                    metric: sum(values) / len(values)
+                    for metric, values in metrics.items()
+                }
+
+            # Save intermediate results
+            final_results = {
+                'dataset_results': all_results,
+                'modality_averages': modality_averages
+            }
+
+            with open(results_path, 'w') as f:
+                json.dump(final_results, f, indent=2)
+
+            logger.info(f'Saved intermediate results after completing dataset {dataset_name}')
+
         except Exception as e:
             logger.error(f'Error training on dataset {dataset_name}: {str(e)}')
             logger.error(traceback.format_exc())
+
+            # Save results even if there's an error
+            final_results = {
+                'dataset_results': all_results,
+                'modality_averages': modality_averages
+            }
+            with open(results_path, 'w') as f:
+                json.dump(final_results, f, indent=2)
+
             continue
-
-    # Group results by modality
-    modality_results = defaultdict(list)
-    modality_metrics = defaultdict(lambda: defaultdict(list))
-
-    for dataset_name, results in all_results.items():
-        modality = dataset_name.split('_')[0]  # Get modality from dataset name
-        modality_results[modality].append((dataset_name, results))
-
-        # Collect metrics for each modality
-        for metric, value in results.items():
-            if isinstance(value, float):
-                modality_metrics[modality][metric].append(value)
-
-    # Calculate averages for each modality
-    modality_averages = {}
-    for modality, metrics in modality_metrics.items():
-        modality_averages[modality] = {
-            metric: sum(values) / len(values)
-            for metric, values in metrics.items()
-        }
-
-    # Save detailed results including modality averages
-    final_results = {
-        'dataset_results': all_results,
-        'modality_averages': modality_averages
-    }
-
-    with open(os.path.join(args.output_path, 'all_results.json'), 'w') as f:
-        json.dump(final_results, f, indent=2)
 
     # Print summary of results
     logger.info('\n\nTraining Complete!\n')
