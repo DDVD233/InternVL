@@ -23,6 +23,8 @@ from torch.utils.data import Dataset, Subset
 from transformers import get_cosine_schedule_with_warmup
 from heavyball import PrecondScheduleForeachSOAP
 import traceback
+import cv2
+from torchvision import transforms
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -177,6 +179,7 @@ class SingleDatasetLazySupervisedDataset(Dataset):
             pad2square=False,
             normalize_type='imagenet',
             random_seed=0,
+            rebuild_vocab=False
     ):
         super(SingleDatasetLazySupervisedDataset, self).__init__()
         self.image_size = image_size
@@ -204,7 +207,10 @@ class SingleDatasetLazySupervisedDataset(Dataset):
                     for index, image in enumerate(data['images']):
                         real_image_path = os.path.join(root, image)
                         data['images'][index] = real_image_path
-
+                if 'videos' in data:
+                    for index, video in enumerate(data['videos']):
+                        real_video_path = os.path.join(root, video)
+                        data['videos'][index] = real_video_path
                 target = data['conversations'][1]['value'].lower()
                 targets = [label.strip() for label in target.split(',')]
                 vocabs.extend(targets)
@@ -214,8 +220,12 @@ class SingleDatasetLazySupervisedDataset(Dataset):
                 bar.update(1)
 
         vocab_path = os.path.join(output_path, f'{dataset_name}_vocabs.json')
-        vocabs = self.build_vocab(vocab_path, vocabs)
-        logger.info(f'Vocab size for {dataset_name}: {len(vocabs)}')
+        if rebuild_vocab:
+            vocabs = self.build_vocab(vocab_path, vocabs)
+            logger.info(f'Vocab size for {dataset_name}: {len(vocabs)}')
+        else:
+            with open(vocab_path, 'r') as f:
+                vocabs = json.load(f)
 
         vocabs_to_index = {v: i for i, v in enumerate(vocabs)}
         self.dataset_multilabel = []
@@ -287,7 +297,13 @@ class SingleDatasetLazySupervisedDataset(Dataset):
         except Exception as e:
             logger.error(f"Error processing item {i}: {e}")
             images = [torch.zeros((3, self.image_size, self.image_size))]
-        pixel_values = [transform(image) for image in images]
+        pixel_values = []
+        for index, image in enumerate(images):
+            # convert to Image if it is tensor
+            if isinstance(image, torch.Tensor):
+                image = transforms.ToPILImage()(image)
+            image = transform(image)
+            pixel_values.append(image)
         pixel_values = torch.stack(pixel_values)
 
         ret = {
@@ -349,6 +365,8 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch):
         # Convert to numpy first to ensure shape consistency
         labels_np = labels.numpy()
         outputs_np = outputs.numpy()
+        logger.info(f"{split} labels shape: {labels_np.shape}")
+        logger.info(f"{split} outputs shape: {outputs_np.shape}")
 
         # Apply sigmoid and get predictions
         predictions_np = (1 / (1 + np.exp(-outputs_np))) > 0.5
@@ -383,7 +401,7 @@ def evaluate_classifier(model, dataset, device, split, bs, step, epoch):
                 average='macro'
             )
         except ValueError:
-            auc = None
+            auc = 0
 
         # Convert to one-hot for binary metrics
         y_true_binary = torch.nn.functional.one_hot(labels, num_classes=outputs.size(1)).numpy()
@@ -415,11 +433,15 @@ def calculate_multilabel_metrics(y_true, y_pred):
     specificities = []
 
     for i in range(n_classes):
-        tn, fp, fn, tp = confusion_matrix(y_true[:, i], y_pred[:, i]).ravel()
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        sensitivities.append(sensitivity)
-        specificities.append(specificity)
+        try:
+            tn, fp, fn, tp = confusion_matrix(y_true[:, i], y_pred[:, i]).ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            sensitivities.append(sensitivity)
+            specificities.append(specificity)
+        except:
+            sensitivities.append(0)
+            specificities.append(0)
 
     return np.mean(sensitivities), np.mean(specificities)
 
@@ -470,6 +492,7 @@ def train_single_dataset(
         dataset_name,
         dataset_output_path,
         is_train=True,
+        rebuild_vocab=True,
     )
 
     val_dataset = SingleDatasetLazySupervisedDataset(
@@ -477,6 +500,7 @@ def train_single_dataset(
         dataset_name,
         dataset_output_path,
         is_train=False,
+        rebuild_vocab=False,
     )
 
     # Initialize model
@@ -660,6 +684,7 @@ def main():
         # Skip if already processed
         if dataset_name in all_results:
             logger.info(f'Skipping dataset {dataset_name} - already processed')
+            logger.info(f'Existing results: {all_results[dataset_name]}')
             continue
 
         logger.info(f'\n{"=" * 50}\nTraining on dataset: {dataset_name}\n{"=" * 50}')

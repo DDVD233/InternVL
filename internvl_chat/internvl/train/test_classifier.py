@@ -23,6 +23,9 @@ from internvl.model.swin_transformer import SwinV2Classifier
 from internvl.model.internvl_chat.modeling_internvl_chat import InternVLChatModel
 from internvl.model.internvl_chat.configuration_internvl_chat import InternVLChatConfig
 from internvl.model.sbb_vit import ViTSBBClassifier
+from internvl.model.medvit_classifier import MedViTClassifier
+from internvl.model.pmc_clip import PMCViTClassifier
+from internvl.model.rad_dino import RadDinoClassifier
 from internvl.train.dataset import build_transform, dynamic_preprocess
 from internvl.model.internvl_chat.internvl_moe import MoEVisionModel
 from PIL import Image
@@ -1075,6 +1078,12 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=
     if 'sbb2' in model_path.lower():
         image_size = 384
         max_dynamic_patch = 1
+    elif 'medvit' in model_path.lower():
+        image_size = 384
+        max_dynamic_patch = 1
+    elif 'rad_dino' in model_path.lower():
+        image_size = 518
+        max_dynamic_patch = 1
     elif 'eva' in model_path.lower():
         image_size = 448
         max_dynamic_patch = 2
@@ -1149,6 +1158,23 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=
     if 'sbb2' in model_path.lower():
         model = ViTSBBClassifier(vision_output_size=vocab_size).cuda()
         # model = model.to(torch.bfloat16)
+
+    elif 'pmc' in model_path.lower():
+        model = PMCViTClassifier(vision_output_size=vocab_size).cuda()
+    elif 'medvit' in model_path.lower():
+        model = MedViTClassifier(vision_output_size=vocab_size).cuda()
+        # load weight
+        weights = torch.load('MedViT_large_im1k.pth')
+        # remove proj
+        for key in list(weights.keys()):
+            if 'proj' in key:
+                weights.pop(key)
+        model.load_state_dict(weights, strict=False)
+        # model = model.to(torch.bfloat16)
+    elif 'rad_dino' in model_path.lower():
+        model = RadDinoClassifier.from_pretrained("microsoft/rad-dino",
+                                                  vision_output_size=vocab_size).cuda()
+        model = model.to(torch.bfloat16)
     elif 'convnext' in model_path.lower():
         model = ConvNextV2Classifier.from_pretrained(
             model_path,  # or any other ConvNeXtV2 checkpoint
@@ -1157,7 +1183,7 @@ def train_classifier(model_path, output_path, lr=1.5e-4, bs=24, wd=0.01, epochs=
         model = model.to(torch.bfloat16)
     elif 'clip' in model_path.lower():
         model = model = OpenCLIPClassifier.from_pretrained(
-            model_path,
+            'ViT-g-14',
             vision_output_size=vocab_size,
             dtype=torch.bfloat16
         ).cuda()

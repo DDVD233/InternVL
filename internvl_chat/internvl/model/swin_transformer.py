@@ -164,7 +164,8 @@ class SwinV2Classifier(nn.Module):
             self,
             pixel_values: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            classify: bool = True
+            classify: bool = True,
+            **kwargs
     ) -> torch.Tensor:
         """
         Forward pass through the vision model.
