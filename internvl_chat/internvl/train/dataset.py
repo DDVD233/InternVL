@@ -27,17 +27,16 @@ from internvl.conversation import get_conv_template
 from PIL import Image
 from torch.utils.data import ConcatDataset, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode
-import numpy as np
 
 from .constants import (CLIP_MEAN, CLIP_STD, IMAGENET_MEAN, IMAGENET_STD,
                         IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN,
                         SIGLIP_MEAN, SIGLIP_STD)
 
-# try:
-#     from petrel_client.client import Client
-#     from petrel_client.common.config import Config
-# except ImportError as E:
-#     print('petrel_client is not installed. If you read data locally instead of from ceph, ignore it.')
+try:
+    from petrel_client.client import Client
+    from petrel_client.common.config import Config
+except ImportError as E:
+    print('petrel_client is not installed. If you read data locally instead of from ceph, ignore it.')
 import sys
 
 
@@ -60,7 +59,7 @@ def check_conversations_repetition(conversations, repeat_threshold=0.4, ngram=10
 
 
 def get_frame_indices(num_frames, vlen, sample='rand', fix_start=None, input_fps=1, max_num_frames=-1):
-    if sample in ['rand', 'middle']:  # uniform sampling
+    if sample in ['rand', 'middle']: # uniform sampling
         acc_samples = min(num_frames, vlen)
         # split the video into `acc_samples` intervals, and sample from each interval.
         intervals = np.linspace(start=0, stop=vlen, num=acc_samples + 1).astype(int)
@@ -266,7 +265,6 @@ def simulate_jpeg_degradation(quality):
             output.seek(0)  # Move the reading cursor to the start of the stream
             img_jpeg = Image.open(output).copy()  # Use .copy() to make sure the image is loaded in memory
         return img_jpeg
-
     return jpeg_degrade
 
 
@@ -284,39 +282,16 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type='imag
         MEAN, STD = SIGLIP_MEAN, SIGLIP_STD
     else:
         raise NotImplementedError
-
-    if is_train:
-
-        # transform = T.Compose([
-        #     T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        #     T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        #     T.ToTensor(),
-        #     T.Normalize(mean=MEAN, std=STD)
-        # ])
+    if is_train:  # use data augumentation
         transform = T.Compose([
             T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-            T.RandomHorizontalFlip(p=0.5),
-            # T.RandomVerticalFlip(p=0.5),
-            # T.RandomRotation(degrees=10),
-            T.RandomApply([
-                T.ColorJitter(brightness=0.2, contrast=0.2)
-            ], p=0.5),
-            T.RandomAdjustSharpness(sharpness_factor=2, p=0.2),
-            T.RandomApply([
-                T.ColorJitter(hue=0.1, saturation=0.2)
-            ], p=0.3),
-            T.RandomAffine(degrees=(10, 30), translate=(0.1, 0.1), scale=(0.9, 1.1),
-                           interpolation=InterpolationMode.BILINEAR),
+            T.RandomChoice([T.Lambda(jpeg_degrade_functions[quality]) for quality in qualities]),
             T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
             T.ToTensor(),
-            T.Normalize(mean=MEAN, std=STD),
-            T.RandomApply([
-                T.ElasticTransform(alpha=50.0, sigma=5.0)
-            ], p=0.1),
-            T.RandomErasing(p=0.1, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0)
+            T.Normalize(mean=MEAN, std=STD)
         ])
     else:
-        if pad2square is False:
+        if pad2square is False:  # now we use this transform function by default
             transform = T.Compose([
                 T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
                 T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
@@ -565,7 +540,6 @@ def preprocess_phi3(
     if not text_only:
         new_conversations = []
         for conversation in conversations:
-            conversation = conversation.replace('<audio>', audio_tokens)
             for i in range(num_image):
                 image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token_list[i]}{IMG_END_TOKEN}'
                 conversation = conversation.replace('<image>', image_tokens, 1)
@@ -676,7 +650,6 @@ def preprocess_internlm(
     if not text_only:
         new_conversations = []
         for conversation in conversations:
-            conversation = conversation.replace('<audio>', audio_tokens)
             for i in range(num_image):
                 image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token_list[i]}{IMG_END_TOKEN}'
                 conversation = conversation.replace('<image>', image_tokens, 1)

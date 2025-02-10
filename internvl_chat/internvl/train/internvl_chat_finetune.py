@@ -60,6 +60,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
+from torch.optim import Optimizer
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -82,6 +83,42 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+
+
+
+class CustomTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        # Extract custom optimizer parameters
+        self.lr = kwargs.pop("learning_rate", 1e-5)
+        self.weight_decay = kwargs.pop("weight_decay", 0.0)
+        super().__init__(*args, **kwargs)
+
+    def create_optimizer(self) -> Optimizer:
+        """
+        Create a custom optimizer with PrecondScheduleForeachSOAP.
+        """
+        if self.optimizer is None:
+            params = self.get_model_parameters()
+
+            from heavyball import PrecondScheduleForeachSOAP
+
+            self.optimizer = PrecondScheduleForeachSOAP(
+                params,
+                lr=self.lr,
+                weight_decay=self.weight_decay
+            )
+
+        return self.optimizer
+
+    def get_model_parameters(self):
+        """
+        Get all model parameters that require gradients.
+        """
+        params = []
+        for param in self.model.parameters():
+            if param.requires_grad:
+                params.append(param)
+        return params
 
 
 @dataclass
@@ -191,6 +228,10 @@ class DataTrainingArguments:
     meta_path: str = field(
         default=None,
         metadata={'help': 'The path of the meta file of datasets.'},
+    )
+    eval_meta_path: str = field(
+        default=None,
+        metadata={'help': 'The path of the meta file of evaluation datasets.'},
     )
     use_data_resampling: bool = field(
         default=False,
@@ -461,6 +502,12 @@ class LazySupervisedDataset(Dataset):
         image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
         assert (ret['input_ids'][0] == image_end_token_id).sum() == 1, f'image tokens are truncated, this dataset is {self.ds_name}'
 
+        logger.info(f'[Dataset] Multimodal num_patches: {num_patches}, '
+                    f'input_id size: {ret["input_ids"][0].size()}, '
+                    f'attention_mask size: {ret["attention_mask"][0].size()},'
+                    f'image_tokens: {(ret["input_ids"][0] == image_end_token_id).sum()}'
+                    f'position_ids size: {position_ids[0].size()}')
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
@@ -510,6 +557,13 @@ class LazySupervisedDataset(Dataset):
         position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
         image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
         assert (ret['input_ids'][0] == image_end_token_id).sum() == num_image, f'image tokens are truncated, this dataset is {self.ds_name}'
+
+        # print(f'[Dataset] Multiimage num_image: {num_image}, '
+        #             f'num_patches: {num_patches}, '
+        #             f'num_tiles: {num_tiles},'
+        #             f'num_image_tokens: {num_image_tokens},'
+        #             f'input_id size: {ret["input_ids"][0].size()},'
+        #             f'attention_mask size: {ret["attention_mask"][0].size()},')
 
         # Create the final return dictionary
         ret = dict(
@@ -610,6 +664,10 @@ class LazySupervisedDataset(Dataset):
         position_ids = ret['attention_mask'].long().cumsum(-1) - 1
         position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
 
+        logger.info(f'[Dataset] Pure text num_image: {num_patches}, '
+                    f'input_id size: {ret["input_ids"][0].size()},'
+                    f'attention_mask size: {ret["attention_mask"][0].size()},')
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
@@ -644,6 +702,8 @@ class LazySupervisedDataset(Dataset):
                 raise StopIteration
             try:
                 data_item = json.loads(self.raw_data[i])
+                if 'images' in data_item:
+                    data_item['image'] = data_item['images']
                 # conversations = data_item['conversations']
                 # check_conversations_repetition(conversations, repeat_threshold=0.4, ngram=10)
                 if 'image' in data_item and len(data_item['image']) != 0:
@@ -711,12 +771,15 @@ def build_datasets(
     min_num_frame=8,
     max_num_frame=32,
     normalize_type='imagenet',
+    is_eval=False,
 ):
     datasets = []
     lengths = []
     data_rank = dist.get_rank()
     data_world_size = dist.get_world_size()
     ds_collections = json.loads(open(data_args.meta_path).read())
+    if is_eval:
+        ds_collections = json.loads(open(data_args.eval_meta_path).read())
     for ds_idx, ds_name in enumerate(ds_collections.keys()):
         repeat_time = ds_collections[ds_name]['repeat_time']
         if 'max_dynamic_patch' in ds_collections[ds_name]:
@@ -822,10 +885,17 @@ def main():
 
     # Setup logging
     logging.basicConfig(
+        level=logging.INFO,  # Set to INFO level to see most relevant logs
         format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.StreamHandler(sys.stderr)
+        ]
     )
+
+    # Ensure the logger named 'logger' also has the right level
+    logger.setLevel(logging.INFO)
 
     if training_args.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
@@ -984,6 +1054,12 @@ def main():
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
         normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
         max_num_frame=data_args.max_num_frame)
+    eval_dataset = build_datasets(
+        data_args, tokenizer, tcs_loader, model, group_by_length=training_args.group_by_length,
+        dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
+        min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
+        normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
+        max_num_frame=data_args.max_num_frame, is_eval=True)
 
     def _freeze_params(module):
         for param in module.parameters():
@@ -1023,6 +1099,7 @@ def main():
             if param.requires_grad:
                 logger.info(name)
 
+
     # set seed for torch dataloaders
     set_seed(training_args.seed)
 
@@ -1038,13 +1115,15 @@ def main():
     else:
         collator = concat_pad_data_collator
 
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=collator,
+        learning_rate=training_args.learning_rate,
+        weight_decay=training_args.weight_decay,
     )
 
     # Training
