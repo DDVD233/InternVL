@@ -632,6 +632,55 @@ class LazySupervisedDataset(Dataset):
         )
         return ret
 
+    def time_series_get_item(self, data_item):
+
+        # Ensure the conversation text contains a time series placeholder
+        if '<time_series>' not in data_item['conversations'][0]['value']:
+            data_item['conversations'][0]['value'] = '<time_series>/n' + data_item['conversations'][0]['value']
+
+        # Get the time series file path
+        ts_file = data_item['time_series']
+        ts_path = os.path.join(self.root, ts_file)
+
+        # Load the time series data and preprocess 
+        ts_signal = self.ts_loader(ts_path) # TODO: add loader
+        ts_features = self.time_series_encoder.representation(ts_signal) # TODO: add encoder
+
+        # Generate a special token string that makes sense for time series.
+        num_patches = ts_features.shape[0] # should be 50 each of embed dim 768
+        special_tokens = '\n'.join([f'TimeStep-{i+1}: <ts>' for i in range(num_patches)])
+
+        preprocess_function = self.get_process_function() # TODO: maybe modify for ts
+        reserved_tokens = [self.num_time_series_token] * num_patches # TODO: add a num_time_series_token
+
+        ret = preprocess_function(
+            self.template_name,
+            [deepcopy(data_item['conversations'])],
+            self.tokenizer,
+            reserved_tokens,
+            group_by_length=self.group_by_length,
+            use_packed_ds=self.use_packed_ds,
+            ds_name=self.ds_name,
+            num_image=num_patches # modality is actually ts here 
+        )
+
+        # Calculate position_ids for the resulting attention mask.
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
+
+        # Construct the final return dictionary.
+        # Here, ts_features (of shape (50, 768)) are placed in the 'pixel_values' slot,
+        # and the modality flag is set to 2 (to indicate time series data).
+        ret = dict(
+            input_ids=ret['input_ids'][0],
+            labels=ret['labels'][0],
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
+            pixel_values=ts_features,
+            image_flags=torch.tensor([2] * num_tokens, dtype=torch.long)
+        )
+        return ret
+
     def pure_text_get_item(self, data_item):
         # Build transformation function
         transform = self.get_transform()
@@ -674,8 +723,8 @@ class LazySupervisedDataset(Dataset):
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             position_ids=position_ids[0],
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([0] * num_patches, dtype=torch.long)
+            pixel_values=pixel_values,  # TODO: might need to change
+            image_flags=torch.tensor([0] * num_patches, dtype=torch.long) # TODO: might need to change
         )
         return ret
 
@@ -713,6 +762,8 @@ class LazySupervisedDataset(Dataset):
                         ret = self.multi_modal_get_item(data_item)
                 elif 'video' in data_item and data_item['video'] is not None and data_item['video'] != '':
                     ret = self.video_get_item(data_item)
+                elif 'time_series' in data_item and data_item['time_series'] not in [None, '']:
+                    ret = self.time_series_get_item(data_item)
                 else:
                     ret = self.pure_text_get_item(data_item)
                 break
