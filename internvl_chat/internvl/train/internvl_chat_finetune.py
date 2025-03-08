@@ -9,14 +9,19 @@ import math
 import os
 import random
 import sys
+import time
 import traceback
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, Optional, List, Union, Any, Tuple
 
 import numpy as np
+from accelerate.utils import find_batch_size
+from torch import nn
+from transformers.integrations import deepspeed_init
+from transformers.trainer_pt_utils import EvalLoopContainer, IterableDatasetShard
 
 try:
     import orjson as json
@@ -34,10 +39,7 @@ from internvl.model.internvl_chat import (InternVisionConfig,
                                           InternVLChatModel)
 from internvl.patch import (concat_pad_data_collator,
                             replace_internlm2_attention_class,
-                            replace_llama_attention_class,
                             replace_llama_rmsnorm_with_fused_rmsnorm,
-                            replace_phi3_attention_class,
-                            replace_qwen2_attention_class,
                             replace_train_dataloader, replace_train_sampler)
 from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
                                       IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
@@ -53,11 +55,12 @@ from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     preprocess_phi3)
 from internvl.train.dataset_packed import PackedDataset, packed_collate_fn
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           HfArgumentParser, Trainer, TrainingArguments,
-                          set_seed)
-from transformers.trainer_utils import get_last_checkpoint
+                          set_seed, is_torch_xla_available)
+from transformers.trainer_utils import get_last_checkpoint, EvalLoopOutput, has_length, EvalPrediction, \
+    denumpify_detensorize
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 from torch.optim import Optimizer
@@ -85,41 +88,336 @@ logger = logging.getLogger(__name__)
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    print(predictions)
+    print(labels)
+
+    # Get model outputs (logits) and convert to predictions
+    predictions = np.argmax(predictions, axis=-1)
+
+    # Create binary arrays for exact match
+    exact_match = (predictions == labels).astype(int)
+
+    # Calculate exact match accuracy
+    exact_match_accuracy = np.mean(exact_match)
+
+    # For sensitivity and specificity, we'll treat positive class as 1
+    # True Positives
+    tp = np.sum((predictions == 1) & (labels == 1))
+    # True Negatives
+    tn = np.sum((predictions == 0) & (labels == 0))
+    # False Positives
+    fp = np.sum((predictions == 1) & (labels == 0))
+    # False Negatives
+    fn = np.sum((predictions == 0) & (labels == 1))
+
+    # Calculate sensitivity (true positive rate)
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+    # Calculate specificity (true negative rate)
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    # Calculate F1 score
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = sensitivity  # recall is the same as sensitivity
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+    metrics = {
+        'exact_match_accuracy': exact_match_accuracy,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'f1_score': f1_score,
+        'precision': precision,
+        'recall': recall
+    }
+
+    return metrics
+
 
 class CustomTrainer(Trainer):
     def __init__(self, *args, **kwargs):
-        # Extract custom optimizer parameters
         self.lr = kwargs.pop("learning_rate", 1e-5)
         self.weight_decay = kwargs.pop("weight_decay", 0.0)
         super().__init__(*args, **kwargs)
 
     def create_optimizer(self) -> Optimizer:
-        """
-        Create a custom optimizer with PrecondScheduleForeachSOAP.
-        """
         if self.optimizer is None:
             params = self.get_model_parameters()
-
             from heavyball import PrecondScheduleForeachSOAP
-
             self.optimizer = PrecondScheduleForeachSOAP(
                 params,
                 lr=self.lr,
                 weight_decay=self.weight_decay
             )
-
         return self.optimizer
 
     def get_model_parameters(self):
-        """
-        Get all model parameters that require gradients.
-        """
         params = []
         for param in self.model.parameters():
             if param.requires_grad:
                 params.append(param)
         return params
 
+    def evaluation_loop_(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        args = self.args
+
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train, handle model prep here
+        if self.is_deepspeed_enabled and self.deepspeed is None:
+            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+
+        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+
+        if len(self.accelerator._models) == 0 and model is self.model:
+            start_time = time.time()
+            model = (
+                self.accelerator.prepare(model)
+                if self.is_deepspeed_enabled or self.is_fsdp_enabled
+                else self.accelerator.prepare_model(model, evaluation_mode=True)
+            )
+            self.model_preparation_time = round(time.time() - start_time, 4)
+
+            if self.is_fsdp_enabled:
+                self.model = model
+
+            # for the rest of this function `model` is the outside model, whether it was wrapped or not
+            if model is not self.model:
+                self.model_wrapped = model
+
+            # backward compatibility
+            if self.is_deepspeed_enabled:
+                self.deepspeed = self.model_wrapped
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+
+        batch_size = self.args.eval_batch_size
+
+        logger.info(f"\n***** Running {description} *****")
+        if has_length(dataloader):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+
+        model.eval()
+        if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
+            self.optimizer.eval()
+
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = getattr(dataloader, "dataset", None)
+
+        if args.past_index >= 0:
+            self._past = None
+
+        # Initialize containers
+        all_losses = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+        all_preds = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+        all_labels = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+        all_inputs = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+
+        metrics = None
+        eval_set_kwargs = {}
+
+        # Will be useful when we have an iterable dataset so don't know its length.
+        observed_num_examples = 0
+
+        # Main evaluation loop
+        for step, inputs in enumerate(dataloader):
+            # Update the observed num examples
+            observed_batch_size = find_batch_size(inputs)
+            if observed_batch_size is not None:
+                observed_num_examples += observed_batch_size
+                # For batch samplers, batch_size is not known by the dataloader in advance.
+                if batch_size is None:
+                    batch_size = observed_batch_size
+
+            # Prediction step
+            losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            main_input_name = getattr(self.model, "main_input_name", "input_ids")
+            inputs_decode = (
+                self._prepare_input(inputs[main_input_name]) if "inputs" in args.include_for_metrics else None
+            )
+
+            # Update containers
+            if losses is not None:
+                losses = self.gather_function((losses.repeat(batch_size)))
+                all_losses.add(losses)
+            if inputs_decode is not None:
+                inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
+                inputs_decode = self.gather_function((inputs_decode))
+                if not self.args.batch_eval_metrics or description == "Prediction":
+                    all_inputs.add(inputs_decode)
+            if labels is not None:
+                # Pad labels here, preparing for preprocess_logits_for_metrics in next logits block.
+                labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+            if logits is not None:
+                logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
+                if self.preprocess_logits_for_metrics is not None:
+                    logits = self.preprocess_logits_for_metrics(logits, labels)
+                logits = self.gather_function((logits))
+                if not self.args.batch_eval_metrics or description == "Prediction":
+                    all_preds.add(logits)
+            if labels is not None:
+                labels = self.gather_function((labels))
+                if not self.args.batch_eval_metrics or description == "Prediction":
+                    all_labels.add(labels)
+
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+            if self.args.batch_eval_metrics:
+                if self.compute_metrics is not None and logits is not None and labels is not None:
+                    is_last_step = self.accelerator.gradient_state.end_of_dataloader
+                    batch_kwargs = {}
+                    batch_kwargs["losses"] = losses if "loss" in args.include_for_metrics else None
+                    batch_kwargs["inputs"] = inputs if "inputs" in args.include_for_metrics else None
+                    metrics = self.compute_metrics(
+                        EvalPrediction(predictions=logits, label_ids=labels, **batch_kwargs),
+                        compute_result=is_last_step,
+                    )
+
+                del losses, logits, labels, inputs
+                torch.cuda.empty_cache()
+
+            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+            elif args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
+                all_losses.to_cpu_and_numpy()
+                all_preds.to_cpu_and_numpy()
+                all_labels.to_cpu_and_numpy()
+                all_inputs.to_cpu_and_numpy()
+
+                del losses, logits, labels, inputs
+                torch.cuda.empty_cache()
+
+        # After all calls to `.gather_function`, reset to `gather_for_metrics`:
+        self.gather_function = self.accelerator.gather_for_metrics
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        # Gather all remaining tensors and put them back on the CPU
+        all_losses = all_losses.get_arrays()
+        all_preds = all_preds.get_arrays()
+        all_labels = all_labels.get_arrays()
+        all_inputs = all_inputs.get_arrays()
+
+        # Number of samples
+        if has_length(eval_dataset):
+            num_samples = len(eval_dataset)
+        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
+        # methods. Therefore we need to make sure it also has the attribute.
+        elif isinstance(eval_dataset, IterableDatasetShard) and getattr(eval_dataset, "num_examples", 0) > 0:
+            num_samples = eval_dataset.num_examples
+        else:
+            if has_length(dataloader):
+                num_samples = self.num_examples(dataloader)
+            else:  # both len(dataloader.dataset) and len(dataloader) fail
+                num_samples = observed_num_examples
+        if num_samples == 0 and observed_num_examples > 0:
+            num_samples = observed_num_examples
+
+        # Metrics!
+        if (
+            self.compute_metrics is not None
+            and all_preds is not None
+            and all_labels is not None
+            and not self.args.batch_eval_metrics
+        ):
+            eval_set_kwargs["losses"] = all_losses if "loss" in args.include_for_metrics else None
+            eval_set_kwargs["inputs"] = all_inputs if "inputs" in args.include_for_metrics else None
+            metrics = self.compute_metrics(
+                EvalPrediction(predictions=all_preds, label_ids=all_labels, **eval_set_kwargs)
+            )
+        elif metrics is None:
+            metrics = {}
+
+        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        metrics = denumpify_detensorize(metrics)
+
+        if isinstance(all_losses, list) and all_losses:
+            metrics[f"{metric_key_prefix}_loss"] = np.concatenate(all_losses).mean().item()
+        elif isinstance(all_losses, np.ndarray):
+            metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
+        if hasattr(self, "jit_compilation_time"):
+            metrics[f"{metric_key_prefix}_jit_compilation_time"] = self.jit_compilation_time
+        if hasattr(self, "model_preparation_time"):
+            metrics[f"{metric_key_prefix}_model_preparation_time"] = self.model_preparation_time
+
+        # Prefix all keys with metric_key_prefix + '_'
+        for key in list(metrics.keys()):
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
+
+    def evaluation_loop(
+            self,
+            dataloader,
+            description,
+            prediction_loss_only=None,
+            ignore_keys=None,
+            metric_key_prefix="eval",
+    ):
+        # Run the standard evaluation loop first
+        eval_output = self.evaluation_loop_(
+            dataloader,
+            description,
+            prediction_loss_only,
+            ignore_keys,
+            metric_key_prefix,
+        )
+
+        # Get predictions and labels
+        predictions = eval_output.predictions
+        labels = eval_output.label_ids
+
+        # Compute our custom metrics
+        metrics = compute_metrics((predictions, labels))
+
+        # Add the custom metrics to the output
+        eval_output.metrics.update(
+            {f"{metric_key_prefix}_{k}": v for k, v in metrics.items()}
+        )
+
+        return eval_output
+
+    def log_metrics(self, split, metrics):
+        """Log metrics in a specially formatted way for easier parsing.
+
+        Args:
+            split: str, one of {"train", "eval"}
+            metrics: dict, metrics to log
+        """
+        # Call the parent class's log_metrics
+        super().log_metrics(split, metrics)
+
+        # Additionally log our custom metrics in a more detailed format
+        if split == "eval":
+            logger.info("***** Evaluation Metrics *****")
+            for key in sorted(metrics.keys()):
+                if any(metric in key for metric in
+                       ['exact_match', 'sensitivity', 'specificity', 'f1', 'precision', 'recall']):
+                    logger.info(f"{key} = {metrics[key]:.4f}")
 
 @dataclass
 class ModelArguments:
@@ -338,6 +636,7 @@ class LazySupervisedDataset(Dataset):
         distributed_mode=False,
         force_shuffle=False,
         random_seed=0,
+        length=-1
     ):
         super(LazySupervisedDataset, self).__init__()
         self.ds_name = ds_name
@@ -371,6 +670,7 @@ class LazySupervisedDataset(Dataset):
         self.force_shuffle = force_shuffle
         # TODO: quick resume
         self._state_dict = {}
+        self.overwrite_length = length
 
         logger.info('Formatting inputs...Skip in lazy mode')
         assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
@@ -423,6 +723,8 @@ class LazySupervisedDataset(Dataset):
                 self.length.append(token_length)
 
     def __len__(self):
+        if self.overwrite_length > 0:
+            return self.overwrite_length
         return len(self.raw_data)
 
     def get_preprocess_function(self):
@@ -558,13 +860,6 @@ class LazySupervisedDataset(Dataset):
         image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
         assert (ret['input_ids'][0] == image_end_token_id).sum() == num_image, f'image tokens are truncated, this dataset is {self.ds_name}'
 
-        # print(f'[Dataset] Multiimage num_image: {num_image}, '
-        #             f'num_patches: {num_patches}, '
-        #             f'num_tiles: {num_tiles},'
-        #             f'num_image_tokens: {num_image_tokens},'
-        #             f'input_id size: {ret["input_ids"][0].size()},'
-        #             f'attention_mask size: {ret["attention_mask"][0].size()},')
-
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
@@ -585,7 +880,7 @@ class LazySupervisedDataset(Dataset):
             data_item['conversations'][0]['value'] = '<video>\n' + data_item['conversations'][0]['value']
 
         # Get the video file path
-        video_file = data_item['video']
+        video_file = data_item['video'][0]
         video_path = os.path.join(self.root, video_file)
 
         # Load the video frames using tcs_loader
@@ -704,6 +999,8 @@ class LazySupervisedDataset(Dataset):
                 data_item = json.loads(self.raw_data[i])
                 if 'images' in data_item:
                     data_item['image'] = data_item['images']
+                if 'videos' in data_item:
+                    data_item['video'] = data_item['videos']
                 # conversations = data_item['conversations']
                 # check_conversations_repetition(conversations, repeat_threshold=0.4, ngram=10)
                 if 'image' in data_item and len(data_item['image']) != 0:
@@ -772,11 +1069,16 @@ def build_datasets(
     max_num_frame=32,
     normalize_type='imagenet',
     is_eval=False,
+    length=-1
 ):
     datasets = []
     lengths = []
-    data_rank = dist.get_rank()
-    data_world_size = dist.get_world_size()
+    try:
+        data_rank = dist.get_rank()
+        data_world_size = dist.get_world_size()
+    except Exception:
+        data_rank = 0
+        data_world_size = 1
     ds_collections = json.loads(open(data_args.meta_path).read())
     if is_eval:
         ds_collections = json.loads(open(data_args.eval_meta_path).read())
@@ -812,6 +1114,7 @@ def build_datasets(
             distributed_mode=data_args.use_packed_ds,
             force_shuffle=data_args.use_packed_ds,
             random_seed=ds_idx,
+            length=length
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
         datasets.append(dataset)
@@ -867,8 +1170,9 @@ def main():
     # Parse input arguments
     # See all possible arguments in src/transformers/training_args.py
     # If use DeepSpeed zero3, init_dist must before HfArgumentParser
-    launcher = os.environ.get('LAUNCHER', 'slurm')
-    init_dist(launcher=launcher, backend='nccl')
+    launcher = os.environ.get('LAUNCHER', None)
+    if launcher is not None:
+        init_dist(launcher=launcher, backend='nccl')
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
         # If we pass only one argument to the script, and it's the path to a json file,
@@ -947,9 +1251,7 @@ def main():
 
     if data_args.use_packed_ds:
         replace_internlm2_attention_class()
-        replace_qwen2_attention_class()
-        replace_phi3_attention_class()
-        replace_llama_attention_class()
+        # replace_llama_attention_class()
 
     if model_args.use_liger:
         from internvl.patch import apply_liger_kernel_to_internvit
@@ -978,6 +1280,9 @@ def main():
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
             model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+        if launcher is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model = model.to(device)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -1059,7 +1364,7 @@ def main():
         dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
         normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
-        max_num_frame=data_args.max_num_frame, is_eval=True)
+        max_num_frame=data_args.max_num_frame, is_eval=True, length=10)
 
     def _freeze_params(module):
         for param in module.parameters():
@@ -1094,7 +1399,7 @@ def main():
             v.requires_grad = True
 
     # print trainable parameters
-    if dist.get_rank() == 0:
+    if launcher is None or dist.get_rank() == 0:
         for name, param in model.named_parameters():
             if param.requires_grad:
                 logger.info(name)
@@ -1125,6 +1430,8 @@ def main():
         learning_rate=training_args.learning_rate,
         weight_decay=training_args.weight_decay,
     )
+
+    trainer.evaluate()
 
     # Training
     if training_args.do_train:

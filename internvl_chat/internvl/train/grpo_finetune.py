@@ -18,7 +18,7 @@ from functools import partial
 from typing import Dict, Literal, Optional, List
 
 import numpy as np
-from pytorch_optimizer import CosineAnnealingWarmupRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     import orjson as json
@@ -64,7 +64,6 @@ from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 from torch.optim import Optimizer
 from trl import GRPOTrainer, GRPOConfig
-
 from heavyball import PrecondScheduleForeachSOAP
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
@@ -93,24 +92,24 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         # Extract custom optimizer parameters
-        self.lr = kwargs.pop("learning_rate", 1e-5)
-        self.weight_decay = kwargs.pop("weight_decay", 0.0)
+        # self.lr = kwargs.pop("learning_rate", 1e-5)
+        # self.weight_decay = kwargs.pop("weight_decay", 0.0)
         super().__init__(*args, **kwargs)
 
-    def create_optimizer(self) -> Optimizer:
-        """
-        Create a custom optimizer with PrecondScheduleForeachSOAP.
-        """
-        if self.optimizer is None:
-            params = self.get_model_parameters()
-
-            self.optimizer = PrecondScheduleForeachSOAP(
-                params,
-                lr=self.lr,
-                weight_decay=self.weight_decay
-            )
-
-        return self.optimizer
+    # def create_optimizer(self) -> Optimizer:
+    #     """
+    #     Create a custom optimizer with PrecondScheduleForeachSOAP.
+    #     """
+    #     if self.optimizer is None:
+    #         params = self.get_model_parameters()
+    #
+    #         self.optimizer = PrecondScheduleForeachSOAP(
+    #             params,
+    #             lr=self.lr,
+    #             weight_decay=self.weight_decay
+    #         )
+    #
+    #     return self.optimizer
 
     def get_model_parameters(self):
         """
@@ -432,6 +431,7 @@ class LazySupervisedDataset(Dataset):
         distributed_mode=False,
         force_shuffle=False,
         random_seed=0,
+        length=-1
     ):
         super(LazySupervisedDataset, self).__init__()
         self.ds_name = ds_name
@@ -492,6 +492,7 @@ class LazySupervisedDataset(Dataset):
         self.min_dynamic_patch = min_dynamic_patch
         self.max_dynamic_patch = max_dynamic_patch
         self.normalize_type = normalize_type
+        self.overwrite_length = length
 
         # If the precomputed length does not exist, roughly estimate the length of
         # each sample to improve the efficiency of group_by_length.
@@ -517,6 +518,8 @@ class LazySupervisedDataset(Dataset):
                 self.length.append(token_length)
 
     def __len__(self):
+        if self.overwrite_length > 0:
+            return self.overwrite_length
         return len(self.raw_data)
 
     def get_preprocess_function(self):
@@ -868,6 +871,7 @@ def build_datasets(
     max_num_frame=32,
     normalize_type='imagenet',
     is_eval=False,
+    length=-1
 ):
     datasets = []
     lengths = []
@@ -908,6 +912,7 @@ def build_datasets(
             distributed_mode=data_args.use_packed_ds,
             force_shuffle=data_args.use_packed_ds,
             random_seed=ds_idx,
+            length=length
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
         datasets.append(dataset)
@@ -974,10 +979,6 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     training_args.use_packed_ds = data_args.use_packed_ds
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    # send_example_telemetry('InternV-Chat', model_args, data_args)
 
     # Setup logging
     logging.basicConfig(
@@ -1155,7 +1156,7 @@ def main():
         dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
         normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
-        max_num_frame=data_args.max_num_frame, is_eval=True)
+        max_num_frame=data_args.max_num_frame, is_eval=True, length=1000)
 
     def _freeze_params(module):
         for param in module.parameters():
@@ -1223,10 +1224,9 @@ def main():
                                              eps=1e-6, weight_decay=training_args.weight_decay,
                                              warmup_steps=training_args.warmup_steps)
     # cosine scheduler
-    scheduler = CosineAnnealingWarmupRestarts(optimizer, first_cycle_steps=training_args.max_steps,
-                                              cycle_mult=1.0, max_lr=training_args.learning_rate,
-                                              min_lr=1e-5, warmup_steps=training_args.warmup_steps,
-                                              gamma=0.5)
+    scheduler = CosineAnnealingLR(optimizer, T_max=training_args.num_train_epochs * len(train_dataset),
+                                    eta_min=training_args.learning_rate / 100)
+
 
     trainer = CustomGRPOTrainer(
         model=model,
